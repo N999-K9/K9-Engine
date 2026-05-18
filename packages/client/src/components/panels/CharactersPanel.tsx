@@ -198,9 +198,10 @@ export function CharactersPanel() {
     }
     // Filter by included tags (OR logic)
     if (includedTags.size > 0) {
+      const lowerIncludedTags = new Set([...includedTags].map((t) => t.toLowerCase()));
       list = list.filter((c) => {
         const tags = new Set(getCharacterTags(c).map((t) => t.toLowerCase()));
-        return [...includedTags].some((tag) => tags.has(tag.toLowerCase()));
+        return [...lowerIncludedTags].some((tag) => tags.has(tag));
       });
     }
     const excludedTagFilters = new Set([
@@ -368,7 +369,11 @@ export function CharactersPanel() {
         });
       default:
         if (hasIncludedTags) {
-          return list.sort((a, b) => (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0));
+          return list.sort((a, b) => {
+            const countDiff = (matchCounts!.get(b.id) ?? 0) - (matchCounts!.get(a.id) ?? 0);
+            if (countDiff !== 0) return countDiff;
+            return (a.parsed.name ?? "").localeCompare(b.parsed.name ?? "");
+          });
         }
         return list;
     }
