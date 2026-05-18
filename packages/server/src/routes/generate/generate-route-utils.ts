@@ -81,6 +81,13 @@ export function isMessageHiddenFromAI(message: { extra?: unknown }): boolean {
   return parseExtra(message.extra).hiddenFromAI === true;
 }
 
+export function canUseMessageForUserRegeneration(input: {
+  message: { role?: unknown; extra?: unknown };
+  supportsHiddenFromAI: boolean;
+}): boolean {
+  return !(input.message.role === "user" && input.supportsHiddenFromAI && isMessageHiddenFromAI(input.message));
+}
+
 function parsePromptAttachments(extra: unknown): PromptAttachment[] | undefined {
   const rawAttachments = parseExtra(extra).attachments;
   if (!Array.isArray(rawAttachments)) return undefined;

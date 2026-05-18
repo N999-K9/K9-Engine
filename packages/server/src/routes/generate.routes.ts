@@ -142,6 +142,7 @@ import { warmLorebookEntryEmbeddings } from "../services/lorebook/embeddings.js"
 import { postToDiscordWebhook } from "../services/discord-webhook.js";
 import {
   appendGenerationTailMessages,
+  canUseMessageForUserRegeneration,
   findLastIndex,
   appendReadableAttachmentsToContent,
   buildUserMessageRegenerationPromptFromSource,
@@ -1123,6 +1124,10 @@ export async function generateRoutes(app: FastifyInstance) {
         regenMsg = scopedMessages.find((m: any) => m.id === input.regenerateMessageId);
         if (!regenMsg) {
           sendSseEvent(reply, { type: "error", data: "Regenerated message not found" });
+          return;
+        }
+        if (!canUseMessageForUserRegeneration({ message: regenMsg, supportsHiddenFromAI })) {
+          sendSseEvent(reply, { type: "error", data: "Cannot regenerate a message hidden from AI" });
           return;
         }
         if (regenMsg.role === "user") {
