@@ -8,11 +8,11 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
+  assembleEntries,
   buildAssistantEntry,
   buildUserEntry,
   currentToSdkUserMessage,
   SDK_VERSION,
-  serializeEntries,
   splitHistoryForResume,
   type CommonSessionMeta,
 } from "../jsonl-entries.ts";
@@ -284,40 +284,50 @@ describe("buildAssistantEntry", () => {
   });
 });
 
-describe("serializeEntries", () => {
-  it("returns empty string for empty entries", () => {
-    assert.equal(serializeEntries([]), "");
+describe("assembleEntries", () => {
+  it("skips system messages (they ride systemPrompt, not the transcript)", () => {
+    const history: ChatMessage[] = [
+      { role: "system", content: "you are helpful" },
+      { role: "user", content: "hi" },
+    ];
+    const entries = assembleEntries(history, META, "m");
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]!.type, "user");
   });
 
-  it("emits one JSON object per line with a trailing newline", () => {
-    const user = buildUserEntry({
-      message: { role: "user", content: "a" },
-      parentUuid: null,
-      meta: META,
-      uuid: "u1",
-      timestamp: fixedTimestamp,
-      promptId: "p1",
-    });
-    const assistant = buildAssistantEntry({
-      message: { role: "assistant", content: "b" },
-      parentUuid: "u1",
-      meta: META,
-      model: "m",
-      uuid: "u2",
-      timestamp: fixedTimestamp,
-      messageId: "msg_1",
-      requestId: "req_1",
-    });
-    const text = serializeEntries([user, assistant]);
-    const lines = text.split("\n");
-    // Two entries + trailing empty string from the final newline = 3.
-    assert.equal(lines.length, 3);
-    assert.equal(lines[2]!, "");
-    const parsed0 = JSON.parse(lines[0]!) as Record<string, unknown>;
-    const parsed1 = JSON.parse(lines[1]!) as Record<string, unknown>;
-    assert.equal(parsed0["type"], "user");
-    assert.equal(parsed1["type"], "assistant");
-    assert.equal(parsed1["parentUuid"], "u1");
+  it("chains parentUuid pointers in order", () => {
+    const history: ChatMessage[] = [
+      { role: "user", content: "1" },
+      { role: "assistant", content: "2" },
+      { role: "user", content: "3" },
+    ];
+    const entries = assembleEntries(history, META, "m");
+    assert.equal(entries.length, 3);
+    assert.equal(entries[0]!.parentUuid, null);
+    assert.equal(entries[1]!.parentUuid, entries[0]!.uuid);
+    assert.equal(entries[2]!.parentUuid, entries[1]!.uuid);
+  });
+
+  it("routes role=tool messages through buildUserEntry (tool_result blocks)", () => {
+    const history: ChatMessage[] = [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "t1", type: "function", function: { name: "f", arguments: "{}" } }],
+      },
+      { role: "tool", content: "result text", tool_call_id: "t1" },
+    ];
+    const entries = assembleEntries(history, META, "m");
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0]!.type, "assistant");
+    assert.equal(entries[1]!.type, "user");
+    const blocks = entries[1]!.message.content as unknown as Array<Record<string, unknown>>;
+    assert.equal(blocks[0]!["type"], "tool_result");
+    assert.equal(blocks[0]!["tool_use_id"], "t1");
+  });
+
+  it("returns an empty entries array for empty history", () => {
+    assert.deepEqual(assembleEntries([], META, "m"), []);
   });
 });
 

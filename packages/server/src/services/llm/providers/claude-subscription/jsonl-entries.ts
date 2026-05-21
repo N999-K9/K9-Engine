@@ -2,12 +2,13 @@
 // Synthetic JSONL entry builder for Claude Code session replay
 // ──────────────────────────────────────────────
 //
-// The Claude Agent SDK's `resume: <sessionId>` option reads a JSONL file at
-// `~/.claude/projects/<cwd-as-dashes>/<sessionId>.jsonl` and replays it as
-// the conversation history the model sees. Marinara synthesizes these files
-// in-process so its `ChatMessage[]` history reaches the model as real
-// multi-turn context instead of being folded into one big
-// `User: ... / Assistant: ...` string prompt.
+// The Claude Agent SDK's `resume` option replays a JSONL transcript as the
+// conversation history the model sees. Marinara builds these entries in-process
+// from its `ChatMessage[]` history and hands them to the SDK through a
+// `SessionStore` adapter (see `session-store.ts`), so prior turns reach the
+// model as real multi-turn context instead of being folded into one big
+// `User: ... / Assistant: ...` string prompt. The SDK — not Marinara — owns
+// the on-disk materialization of these entries.
 //
 // Schema mirrors what the CLI writes (observed in SDK v2.1.x sessions) but
 // omits hook/UI noise entries (queue-operation, last-prompt, attachment,
@@ -63,7 +64,11 @@ export interface CommonSessionMeta {
   permissionMode: string;
 }
 
-export interface SyntheticUserEntry {
+// Declared as `type` aliases (not `interface`) so the union is assignable to
+// the SDK's loose `SessionStoreEntry` (`{ type: string; [k: string]: unknown }`)
+// without a cast — object-literal type aliases carry an implicit index
+// signature; interfaces do not.
+export type SyntheticUserEntry = {
   parentUuid: string | null;
   isSidechain: false;
   promptId: string;
@@ -78,7 +83,7 @@ export interface SyntheticUserEntry {
   sessionId: string;
   version: string;
   gitBranch: string;
-}
+};
 
 export interface SyntheticAssistantMessage {
   model: string;
@@ -91,7 +96,7 @@ export interface SyntheticAssistantMessage {
   usage: { input_tokens: number; output_tokens: number };
 }
 
-export interface SyntheticAssistantEntry {
+export type SyntheticAssistantEntry = {
   parentUuid: string | null;
   isSidechain: false;
   message: SyntheticAssistantMessage;
@@ -105,7 +110,7 @@ export interface SyntheticAssistantEntry {
   sessionId: string;
   version: string;
   gitBranch: string;
-}
+};
 
 export type SyntheticEntry = SyntheticUserEntry | SyntheticAssistantEntry;
 
@@ -283,9 +288,34 @@ export function buildAssistantEntry(args: {
   };
 }
 
-export function serializeEntries(entries: readonly SyntheticEntry[]): string {
-  if (entries.length === 0) return "";
-  return entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+/**
+ * Build the parent-uuid-chained entry list the SDK's resume path replays.
+ * System messages are excluded — they ride the SDK's `systemPrompt` option,
+ * not the transcript. Each entry points its `parentUuid` at the prior entry's
+ * `uuid` so the SDK can walk the conversation back to its root.
+ */
+export function assembleEntries(
+  history: readonly ChatMessage[],
+  meta: CommonSessionMeta,
+  model: string,
+): SyntheticEntry[] {
+  const entries: SyntheticEntry[] = [];
+  let parentUuid: string | null = null;
+
+  for (const m of history) {
+    if (m.role === "system") continue;
+
+    if (m.role === "user" || m.role === "tool") {
+      const entry = buildUserEntry({ message: m, parentUuid, meta });
+      entries.push(entry);
+      parentUuid = entry.uuid;
+    } else if (m.role === "assistant") {
+      const entry = buildAssistantEntry({ message: m, parentUuid, meta, model });
+      entries.push(entry);
+      parentUuid = entry.uuid;
+    }
+  }
+  return entries;
 }
 
 // ──────────────────────────────────────────────

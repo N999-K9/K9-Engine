@@ -227,11 +227,12 @@ export function getLogPreset() {
 }
 
 /**
- * Kill switch for the `claude_subscription` provider's JSONL-resume code path.
+ * Kill switch for the `claude_subscription` provider's resume code path.
  * Default `true`; set `CLAUDE_SUBSCRIPTION_USE_RESUME=false` (or `0`/`off`/`no`)
- * to revert to the legacy transcript-fold path. The provider also auto-falls
- * back to transcript-fold on EACCES/EPERM/ENOENT when writing the temp session
- * file (covers service-user / sandboxed deployments).
+ * to revert to the legacy transcript-fold path. When enabled, prior turns are
+ * fed to the Claude Agent SDK through its `sessionStore` resume mechanism so
+ * prompt caching holds across turns; if that setup fails (e.g. a read-only
+ * data directory) the provider degrades to transcript-fold for that request.
  */
 export function isClaudeSubscriptionResumeEnabled() {
   const raw = normalizeEnvValue(process.env.CLAUDE_SUBSCRIPTION_USE_RESUME);

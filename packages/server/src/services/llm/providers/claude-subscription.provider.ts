@@ -20,19 +20,18 @@
 //     same mechanism Zed and other IDE integrations use.
 //   • SDK docs: https://docs.anthropic.com/en/docs/claude-code/sdk
 //
+import { randomUUID } from "node:crypto";
 import { BaseLLMProvider, type ChatMessage, type ChatOptions, type LLMUsage } from "../base-provider.js";
 import { logger } from "../../../lib/logger.js";
 import { isClaudeSubscriptionResumeEnabled } from "../../../config/runtime-config.js";
 import {
+  assembleEntries,
   currentToSdkUserMessage,
   SDK_VERSION,
   splitHistoryForResume,
   type SdkUserMessageForPrompt,
 } from "./claude-subscription/jsonl-entries.js";
-import {
-  cleanupSessionFile,
-  constructSessionFile,
-} from "./claude-subscription/synthetic-session.js";
+import { ResumeSessionStore, resumeScratchCwd } from "./claude-subscription/session-store.js";
 
 /**
  * Lazy import wrapper. The SDK is heavy and pulls in optional native pieces;
@@ -60,48 +59,6 @@ export function __setSdkForTesting(mod: Pick<SdkModule, "query"> | null): void {
   cachedSdk = mod ? (Promise.resolve(mod as SdkModule) as Promise<SdkModule>) : null;
 }
 
-// ──────────────────────────────────────────────
-// Resume-path mode tracking (module-scoped, not per-instance)
-// ──────────────────────────────────────────────
-//
-// `useResume` is decided lazily per request because (a) env-var changes pick
-// up automatically on next request, and (b) a temp-write failure (EACCES /
-// EPERM / ENOENT on the user's `~/.claude/projects/`) demotes the provider
-// to the fold path for a cool-down window without losing the next request.
-//
-// Provider instances are typically constructed per connection / per request,
-// so caching this on `this` would amount to no caching at all on the success
-// path and a noisy warn on each instance on the failure path. Module scope
-// gives one warn per cooldown across all instances.
-
-const RESUME_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
-let resumeDisabledUntil = 0;
-let resumeDisabledReason: string | null = null;
-
-// Errno codes that mean "we couldn't write the session file because of the
-// filesystem, not because of a bug" — the right response is to demote to the
-// fold path and try again later. EACCES / EPERM / EROFS cover the common
-// sandboxed-deployment cases (read-only homedir, wrong user, etc.). ENOENT
-// is here as defense-in-depth: `constructSessionFile` calls mkdir-recursive
-// first, but a race (someone deletes the directory between mkdir and
-// writeFile) or a malformed CLAUDE_CONFIG_DIR pointing past a missing
-// ancestor would still surface as ENOENT and should demote, not crash.
-function isWriteFailure(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const code = (err as { code?: string }).code;
-  return code === "EACCES" || code === "EPERM" || code === "ENOENT" || code === "EROFS";
-}
-
-function markResumeUnavailable(reason: string, err: unknown): void {
-  resumeDisabledUntil = Date.now() + RESUME_FAILURE_COOLDOWN_MS;
-  resumeDisabledReason = reason;
-  logger.warn(
-    err,
-    "[claude-subscription] resume path unavailable (%s); falling back to transcript fold for ~5min",
-    reason,
-  );
-}
-
 /**
  * Wrap a single SDK-shaped user message in an AsyncIterable suitable for the
  * SDK's `prompt: AsyncIterable<SDKUserMessage>` form. We yield once and
@@ -114,25 +71,6 @@ function markResumeUnavailable(reason: string, err: unknown): void {
  */
 async function* singleMessageIterable(msg: SdkUserMessageForPrompt): AsyncIterable<unknown> {
   yield msg;
-}
-
-function shouldUseResume(): boolean {
-  if (!isClaudeSubscriptionResumeEnabled()) return false;
-  if (process.platform === "win32") return false;
-  // `resumeDisabledUntil === 0` means we've never tripped a cooldown — fall
-  // through to the happy path. A non-zero value means a prior failure put
-  // us in cooldown; either we're still inside the window (return false) or
-  // we've come out the other side and should reset before continuing.
-  if (resumeDisabledUntil > 0) {
-    if (resumeDisabledUntil > Date.now()) return false;
-    logger.info(
-      "[claude-subscription] resume cooldown expired (last reason: %s); re-attempting resume path",
-      resumeDisabledReason ?? "unknown",
-    );
-    resumeDisabledUntil = 0;
-    resumeDisabledReason = null;
-  }
-  return true;
 }
 
 /**
@@ -189,58 +127,54 @@ function renderTranscript(messages: ChatMessage[]): { systemPrompt: string | und
 /**
  * The set of values the SDK call needs from the path-selection step. Pulled
  * out so `chat()` reads as a straight line — pick a path, build options,
- * call the SDK — instead of carrying five `let` declarations and a
- * definite-assignment assertion across a 30-line branch.
+ * call the SDK — instead of carrying several `let` declarations across a
+ * 30-line branch.
  *
- * `sessionPath` is the cleanup handle for the `finally` block: non-null only
- * when the resume path actually wrote a JSONL (history > 0). The
- * empty-history resume sub-path uses the AsyncIterable prompt directly with
- * no file to clean up.
+ * `sessionStore` / `resumeSessionId` / `resumeCwd` are all non-null together
+ * (resume path with prior history) or all null together (fold path, or the
+ * empty-history resume sub-path which sends the current turn directly).
  */
 interface PromptSelection {
   promptArg: string | AsyncIterable<unknown>;
   systemPrompt: string | undefined;
-  sessionPath: string | null;
   resumeSessionId: string | null;
   resumeCwd: string | null;
+  sessionStore: ResumeSessionStore | null;
 }
 
 /**
  * Pick the resume path or the fold path for this request, and produce
- * everything the SDK call needs. Resolved per-call so env-var changes and
- * cool-down expiries take effect on the next request without restart.
+ * everything the SDK call needs. Resolved per-call so env-var changes take
+ * effect on the next request without a restart.
  */
-async function selectPromptPath(messages: ChatMessage[], model: string): Promise<PromptSelection> {
-  if (shouldUseResume()) {
+function selectPromptPath(messages: ChatMessage[], model: string): PromptSelection {
+  if (isClaudeSubscriptionResumeEnabled()) {
     try {
-      return await buildResumeSelection(messages, model);
+      return buildResumeSelection(messages, model);
     } catch (err) {
-      if (isWriteFailure(err)) {
-        markResumeUnavailable("session-file write failed", err);
-      } else {
-        // Non-FS errors (SDK regressions, programming mistakes, unexpected
-        // failures from `splitHistoryForResume` or its helpers) propagate
-        // intentionally. Silently demoting on every error would mask bugs
-        // that need to surface as failed requests so they get noticed.
-        throw err;
-      }
+      // The only realistic failure is creating the scratch working directory
+      // on a read-only / permission-locked data dir. Degrade to the fold path
+      // for this request rather than failing the chat outright.
+      logger.warn(
+        err,
+        "[claude-subscription] resume path setup failed; using transcript fold for this request",
+      );
     }
   }
   return buildFoldSelection(messages);
 }
 
-async function buildResumeSelection(messages: ChatMessage[], model: string): Promise<PromptSelection> {
+function buildResumeSelection(messages: ChatMessage[], model: string): PromptSelection {
   const split = splitHistoryForResume(messages);
   const systemPrompt = extractSystemPrompt(messages);
 
   if (split.history.length === 0) {
-    // Writing an empty JSONL would make the SDK throw "No conversation found
-    // with session ID: ..." — its session loader treats `messages.length ===
-    // 0` as a missing session, not as a valid zero-turn resume. So when the
-    // caller's history has nothing to resume from (single-turn requests,
-    // connection pings, system-only context), skip the file write entirely
-    // and send the current turn straight through the AsyncIterable prompt.
-    // Nothing to clean up afterward.
+    // Resuming an empty transcript makes the SDK throw "No conversation found
+    // with session ID: ..." — its loader treats a zero-entry session as
+    // missing, not as a valid zero-turn resume. So when the caller's history
+    // has nothing to resume from (single-turn requests, connection pings,
+    // system-only context), skip resume entirely and send the current turn
+    // straight through the AsyncIterable prompt.
     logger.debug(
       "[claude-subscription] resume path: shape=%s history=empty (direct prompt, no resume)",
       split.shape,
@@ -248,31 +182,35 @@ async function buildResumeSelection(messages: ChatMessage[], model: string): Pro
     return {
       promptArg: singleMessageIterable(currentToSdkUserMessage(split.current)),
       systemPrompt,
-      sessionPath: null,
       resumeSessionId: null,
       resumeCwd: null,
+      sessionStore: null,
     };
   }
 
-  const cwd = process.cwd();
-  const { sessionId, path } = await constructSessionFile(split.history, {
+  // Mint a fresh sessionId per request; it keys the in-process SessionStore
+  // and is what the SDK resumes by. The SDK calls `sessionStore.load()` once
+  // before subprocess spawn, materializes the entries to its own temp JSONL,
+  // and resumes from there — Marinara writes nothing to disk itself.
+  const sessionId = randomUUID();
+  const cwd = resumeScratchCwd();
+  const entries = assembleEntries(
+    split.history,
+    { sessionId, cwd, version: SDK_VERSION, gitBranch: "main", permissionMode: "bypassPermissions" },
     model,
-    cwd,
-    sdkVersion: SDK_VERSION,
-  });
+  );
   logger.debug(
-    "[claude-subscription] resume path: shape=%s sessionId=%s path=%s historyLen=%d",
+    "[claude-subscription] resume path: shape=%s sessionId=%s historyLen=%d",
     split.shape,
     sessionId,
-    path,
     split.history.length,
   );
   return {
     promptArg: singleMessageIterable(currentToSdkUserMessage(split.current)),
     systemPrompt,
-    sessionPath: path,
     resumeSessionId: sessionId,
     resumeCwd: cwd,
+    sessionStore: new ResumeSessionStore(sessionId, entries),
   };
 }
 
@@ -282,9 +220,9 @@ function buildFoldSelection(messages: ChatMessage[]): PromptSelection {
   return {
     promptArg: folded.prompt,
     systemPrompt: folded.systemPrompt,
-    sessionPath: null,
     resumeSessionId: null,
     resumeCwd: null,
+    sessionStore: null,
   };
 }
 
@@ -318,7 +256,7 @@ export class ClaudeSubscriptionProvider extends BaseLLMProvider {
     const contextFit = this.fitMessagesToContext(messages, { ...options, maxTokens: configuredMaxTokens });
     this.logContextTrim(contextFit, options.model);
 
-    const { promptArg, systemPrompt, sessionPath, resumeSessionId, resumeCwd } = await selectPromptPath(
+    const { promptArg, systemPrompt, resumeSessionId, resumeCwd, sessionStore } = selectPromptPath(
       contextFit.messages,
       options.model,
     );
@@ -407,14 +345,17 @@ export class ClaudeSubscriptionProvider extends BaseLLMProvider {
 
     this.applyCustomParameters(sdkOptions as Record<string, unknown>, options);
 
-    // Resume + cwd are RESERVED keys: they're load-bearing for the resume
-    // path's contract (the SDK must read JSONL from a path derived from cwd
-    // and resume the session by ID). A connection's customParameters with a
-    // stray `resume` or `cwd` would otherwise silently break the wiring.
-    // Write them AFTER applyCustomParameters so they always win.
-    if (resumeSessionId && resumeCwd) {
-      (sdkOptions as Record<string, unknown>)["resume"] = resumeSessionId;
-      (sdkOptions as Record<string, unknown>)["cwd"] = resumeCwd;
+    // resume + cwd + sessionStore are RESERVED keys: load-bearing for the
+    // resume path's contract (the SDK loads the injected history from
+    // `sessionStore.load()` and resumes the session by ID). A connection's
+    // customParameters with a stray resume/cwd/sessionStore would otherwise
+    // silently break the wiring. Write them AFTER applyCustomParameters so
+    // they always win.
+    if (resumeSessionId && resumeCwd && sessionStore) {
+      const reserved = sdkOptions as Record<string, unknown>;
+      reserved["resume"] = resumeSessionId;
+      reserved["cwd"] = resumeCwd;
+      reserved["sessionStore"] = sessionStore;
     }
 
     let inputTokens = 0;
@@ -488,14 +429,14 @@ export class ClaudeSubscriptionProvider extends BaseLLMProvider {
                 options.model,
                 usedModels.join(", "),
                 fastModeState ?? "unknown",
-                sessionPath ?? "fold-path",
+                resumeSessionId ?? "fold-path",
               );
             } else if (fastModeState && fastModeState !== "off") {
               logger.warn(
                 "[claude-subscription] fast_mode_state=%s for %s (session=%s) — output may come from a smaller model than requested",
                 fastModeState,
                 options.model,
-                sessionPath ?? "fold-path",
+                resumeSessionId ?? "fold-path",
               );
             }
             const finalResult = typeof message.result === "string" ? message.result : "";
@@ -514,20 +455,15 @@ export class ClaudeSubscriptionProvider extends BaseLLMProvider {
         err,
         "Claude Agent SDK query failed for model %s (session=%s)",
         options.model,
-        sessionPath ?? "fold-path",
+        resumeSessionId ?? "fold-path",
       );
       const friendly = err instanceof Error ? err.message : String(err);
       throw new Error(`Claude (Subscription) request failed: ${friendly}`);
     } finally {
       if (options.signal) options.signal.removeEventListener("abort", onUpstreamAbort);
-      // Cleanup is best-effort — `cleanupSessionFile` swallows ENOENT and
-      // logs anything else. The boot-time orphan sweep is the canonical GC
-      // for cases where this `finally` doesn't run (process crash).
-      if (sessionPath) {
-        void cleanupSessionFile(sessionPath).catch(() => {
-          // already logged inside cleanupSessionFile
-        });
-      }
+      // No session-file cleanup: the SDK owns the temp JSONL it materializes
+      // from `sessionStore.load()` and reaps it itself. The in-process
+      // ResumeSessionStore is just a GC'd object.
     }
 
     if (!emittedText) {
