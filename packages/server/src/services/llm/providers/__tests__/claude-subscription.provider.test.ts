@@ -93,30 +93,31 @@ async function drainProviderChat(provider: ClaudeSubscriptionProvider, messages:
   return chunks;
 }
 
-describe("ClaudeSubscriptionProvider — resume path wiring", () => {
+// The resume-path wiring exercises the Unix-only synthetic-session machinery:
+// POSIX project-dir path math plus a real write under ~/.claude/projects/.
+// Forcing `process.platform` flips the provider's win32 gate but NOT node:path's
+// separator behaviour (that's bound at module load), so on a real Windows host
+// the derived session path is malformed, the provider correctly falls back to
+// the fold path, and every resume assertion fails for a reason that is not a
+// real regression. Skip the suite on win32 instead — the win32 contract that
+// matters (fold-path fallback) has its own describe below.
+const WIN32_SKIP =
+  process.platform === "win32" &&
+  "resume-path wiring is Unix-only — win32 uses the fold path (see the fold-path describe)";
+
+describe("ClaudeSubscriptionProvider — resume path wiring", { skip: WIN32_SKIP }, () => {
   let tmpCwd: string;
   let priorCwd: string;
-  let priorPlatform: NodeJS.Platform;
 
   beforeEach(async () => {
     tmpCwd = await mkdtemp(join(tmpdir(), "marinara-provider-test-"));
     priorCwd = process.cwd();
-    priorPlatform = process.platform;
-    // Force non-win32 so the resume path is exercised even when this test
-    // runs on a Windows CI host. We restore in afterEach.
-    if (priorPlatform === "win32") {
-      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-    }
     process.chdir(tmpCwd);
   });
 
   afterEach(async () => {
     process.chdir(priorCwd);
     __setSdkForTesting(null);
-    // Restore platform.
-    if (process.platform !== priorPlatform) {
-      Object.defineProperty(process, "platform", { value: priorPlatform, configurable: true });
-    }
     // Best-effort cleanup of the per-test sessions directory under ~/.claude/projects/.
     await rm(sessionsDirFor(tmpCwd), { recursive: true, force: true });
     // And the tmp working dir itself.
