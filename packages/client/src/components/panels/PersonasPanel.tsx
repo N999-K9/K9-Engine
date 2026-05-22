@@ -591,9 +591,15 @@ export function PersonasPanel() {
               return (
                 <div key={group.id} className="rounded-xl bg-[var(--secondary)]/60 ring-1 ring-[var(--border)]/50">
                   {/* Group header */}
-                  <div className="flex items-center gap-1.5 px-2.5 py-2">
+                  <div
+                    className="flex cursor-pointer items-center gap-1.5 px-2.5 py-2"
+                    onClick={() => setExpandedGroupId(isExpanded ? null : group.id)}
+                  >
                     <button
-                      onClick={() => setExpandedGroupId(isExpanded ? null : group.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setExpandedGroupId(isExpanded ? null : group.id);
+                      }}
                       className="shrink-0 text-[var(--muted-foreground)]"
                     >
                       {isExpanded ? <ChevronDown size="0.75rem" /> : <ChevronRight size="0.75rem" />}
@@ -611,6 +617,7 @@ export function PersonasPanel() {
                             setEditGroupName("");
                           }
                         }}
+                        onClick={(e) => e.stopPropagation()}
                         onBlur={() => handleRenameGroup(group.id)}
                         className="min-w-0 flex-1 bg-transparent text-xs font-medium outline-none"
                       />
@@ -623,7 +630,8 @@ export function PersonasPanel() {
                     {/* Actions */}
                     <div className="flex items-center gap-0.5">
                       <button
-                        onClick={() => {
+                        onClick={(e) => {
+                          e.stopPropagation();
                           if (assigningToGroup !== group.id) exitSelectionMode();
                           setAssigningToGroup(assigningToGroup === group.id ? null : group.id);
                         }}
@@ -638,7 +646,8 @@ export function PersonasPanel() {
                         <UserPlus size="0.75rem" />
                       </button>
                       <button
-                        onClick={() => {
+                        onClick={(e) => {
+                          e.stopPropagation();
                           setEditingGroupId(group.id);
                           setEditGroupName(group.name);
                         }}
@@ -648,7 +657,8 @@ export function PersonasPanel() {
                         <Pencil size="0.75rem" />
                       </button>
                       <button
-                        onClick={async () => {
+                        onClick={async (e) => {
+                          e.stopPropagation();
                           if (
                             !(await showConfirmDialog({
                               title: "Delete Group",
