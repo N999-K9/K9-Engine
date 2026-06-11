@@ -407,12 +407,14 @@ export const ConversationMessage = memo(function ConversationMessage({
     isBubbleStyle && !!isStreaming && renderedContentParts?.length ? renderedContentParts.join("\n\n") : null;
   const shouldHideUserAvatar = (isUser && !!hideUserAvatar) || (isBubbleStyle && isUser);
   const bubbleCornerClass = isUser
-    ? bubbleGroupPosition === "middle" ? "rounded-2xl rounded-r-md"
-    : bubbleGroupPosition === "last" ? "rounded-2xl rounded-tr-md rounded-br-md"
-    : "rounded-2xl rounded-br-md"
+    ? bubbleGroupPosition === "single" ? "rounded-2xl"
+    : bubbleGroupPosition === "first" ? "rounded-2xl rounded-br-md"
+    : bubbleGroupPosition === "middle" ? "rounded-2xl rounded-r-md"
+    : "rounded-2xl rounded-tr-md"
+    : bubbleGroupPosition === "single" ? "rounded-2xl"
+    : bubbleGroupPosition === "first" ? "rounded-2xl rounded-bl-md"
     : bubbleGroupPosition === "middle" ? "rounded-2xl rounded-l-md"
-    : bubbleGroupPosition === "last" ? "rounded-2xl rounded-tl-md rounded-bl-md"
-    : "rounded-2xl rounded-bl-md";
+    : "rounded-2xl rounded-tl-md";
 
   // ── Build shared render context ──
   const ctx: MessageRenderContext = {

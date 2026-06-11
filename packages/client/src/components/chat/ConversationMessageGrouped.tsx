@@ -40,6 +40,7 @@ export function ConversationMessageGrouped({
     showActions,
     forceShowActions,
     hideActions,
+    hideTimestamp,
     showMessageNumbers,
     messageIndex,
     hasSwipes,
@@ -73,7 +74,7 @@ export function ConversationMessageGrouped({
   return (
     <div
       ref={msgRef}
-        className={cn(
+      className={cn(
         "relative px-4 py-0.5 transition-colors hover:bg-[var(--secondary)]/30",
         !noHoverGroup && "group",
         isGrouped ? "mt-0" : "mt-3",
@@ -167,7 +168,7 @@ export function ConversationMessageGrouped({
                           <span className="text-[0.9375rem] font-semibold leading-tight hover:underline cursor-default" style={nameColorStyle(segColor)}>
                             {segName}
                           </span>
-                          {isFirst && (
+                          {isFirst && !hideTimestamp && (
                             <span className="text-[0.6875rem] text-[var(--muted-foreground)]/60">
                               {formatTimestamp(message.createdAt)}
                             </span>

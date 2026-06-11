@@ -375,8 +375,14 @@ export function ConversationView({
     !thinkingBuffer &&
     streamHadContentRef.current;
 
-  const shouldRenderLiveStreamMessage = hasLiveStream && !delayedCharacterInfo && !regenerateMessageId && !isStreamWindingDown;
-  const showTypingIndicator = hasLiveStream && !delayedCharacterInfo && !!regenerateMessageId && !streamBuffer && !thinkingBuffer && conversationMessageStyle !== "bubble";
+  const shouldRenderLiveStreamMessage =
+    hasLiveStream &&
+    !delayedCharacterInfo &&
+    !regenerateMessageId &&
+    !isStreamWindingDown &&
+    (conversationMessageStyle === "bubble" || !!streamBuffer || !!thinkingBuffer);
+  const showTypingIndicator =
+    hasLiveStream && !delayedCharacterInfo && !streamBuffer && !thinkingBuffer && conversationMessageStyle !== "bubble";
 
   // ── Periodic status refresh (every 60s) ──
   // Keeps status dots in sync with the character's schedule regardless of autonomous messaging
@@ -752,6 +758,7 @@ export function ConversationView({
   // ── Staggered reveal for assistant display parts ──
   // Reveal chunks inside one real message so Classic gets cadence without fake rows.
   const [visiblePartCounts, setVisiblePartCounts] = useState<Record<string, number>>({});
+  const renderedMessageKeysRef = useRef<Set<string>>(new Set());
   const prevRenderedKeysRef = useRef<Set<string>>(new Set());
   // Track whether the initial data load has settled. Until it has, we treat
   // all arriving keys as "already seen" so re-mounting the component (or the
@@ -771,6 +778,7 @@ export function ConversationView({
     prevChatIdRef.current = chatId;
     initialLoadSettledRef.current = false;
     prevRenderedKeysRef.current = new Set();
+    renderedMessageKeysRef.current = new Set();
     staggerTimersRef.current.forEach(clearTimeout);
     staggerTimersRef.current = [];
     setVisiblePartCounts({});
@@ -779,6 +787,16 @@ export function ConversationView({
   useLayoutEffect(() => {
     const messageItems = renderedItems.filter((item) => item.type === "message");
     const currentKeys = new Set(messageItems.map((item) => item.key));
+    renderedMessageKeysRef.current = currentKeys;
+    setVisiblePartCounts((prev) => {
+      let changed = false;
+      const next: Record<string, number> = {};
+      for (const [key, count] of Object.entries(prev)) {
+        if (currentKeys.has(key)) next[key] = count;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
 
     // On the very first render that has messages, just snapshot the keys and
     // mark the initial load as settled — don't stagger or play sounds.
@@ -857,6 +875,7 @@ export function ConversationView({
         const delay = (partIndex - 1) * 1500;
         staggerTimersRef.current.push(
           setTimeout(() => {
+            if (!renderedMessageKeysRef.current.has(key)) return;
             setVisiblePartCounts((prev) => ({ ...prev, [key]: partIndex }));
             if (useUIStore.getState().convoNotificationSound) {
               playNotificationPing();
