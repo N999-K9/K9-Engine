@@ -6,9 +6,11 @@ import {
   DEFAULT_AGENT_TOOLS,
   applyQuestUpdatesToPlayerStats,
   getDefaultBuiltInAgentSettings,
+  isAgentAvailableInChatMode,
   stripMacroComments,
   type AgentContext,
   type AgentResult,
+  type ChatMode,
   type GameMap,
 } from "@marinara-engine/shared";
 import { eq } from "drizzle-orm";
@@ -69,10 +71,7 @@ import {
   normalizeSpriteDisplayModes,
   validateSpriteExpressionEntries,
 } from "./expression-agent-utils.js";
-import {
-  ILLUSTRATOR_TEXT_NEGATIVE_PROMPT,
-  resolveIllustratorCharacterReferences,
-} from "./illustrator-references.js";
+import { ILLUSTRATOR_TEXT_NEGATIVE_PROMPT, resolveIllustratorCharacterReferences } from "./illustrator-references.js";
 import {
   normalizeContextInjections,
   normalizeSecretPlotSceneDirections,
@@ -518,7 +517,9 @@ async function buildRetryAgentContext(args: {
         expressionTargetIds.add(personaContext.personaId);
       }
       const targetedSprites =
-        expressionTargetIds.size > 0 ? perChar.filter((sprite) => expressionTargetIds.has(sprite.characterId)) : perChar;
+        expressionTargetIds.size > 0
+          ? perChar.filter((sprite) => expressionTargetIds.has(sprite.characterId))
+          : perChar;
       if (targetedSprites.length > 0 || expressionTargetIds.size > 0) {
         agentContext.memory._availableSprites = targetedSprites;
         if (expressionTargetIds.size > 0) {
@@ -606,7 +607,12 @@ async function resolveRetryAgents(args: {
   agentsStore: ReturnType<typeof createAgentsStorage>;
 }): Promise<ResolvedRetryAgents> {
   const { agentTypes, chat, conns, agentsStore } = args;
-  const agentTypeSet = new Set(filterGameInternalAgentIds((chat as any).mode, agentTypes));
+  const chatMode = ((chat as { mode?: ChatMode }).mode ?? "conversation") as ChatMode;
+  const agentTypeSet = new Set(
+    filterGameInternalAgentIds(chatMode, agentTypes).filter((agentType) =>
+      isAgentAvailableInChatMode(chatMode, agentType),
+    ),
+  );
   const configs = await agentsStore.list();
   const enabledConfigs = configs.filter((config: any) => agentTypeSet.has(config.type));
   const resolvedTypeSet = new Set(enabledConfigs.map((config: any) => config.type));
@@ -821,7 +827,8 @@ const LOREBOOK_WRITE_TOOL_NAME = "save_lorebook_entry";
 
 function resolveRetryAgentWritableLorebookId(settings: Record<string, unknown>): string | null {
   const enabledTools = Array.isArray(settings.enabledTools) ? settings.enabledTools : [];
-  const lorebookWriteEnabled = settings.lorebookWriteEnabled === true || enabledTools.includes(LOREBOOK_WRITE_TOOL_NAME);
+  const lorebookWriteEnabled =
+    settings.lorebookWriteEnabled === true || enabledTools.includes(LOREBOOK_WRITE_TOOL_NAME);
   if (!lorebookWriteEnabled) return null;
   for (const key of ["writableLorebookId", "targetLorebookId"]) {
     const value = settings[key];
@@ -2492,7 +2499,8 @@ export async function registerRetryAgentsRoute(app: FastifyInstance) {
                 [...agentContext.recentMessages]
                   .reverse()
                   .find((message) => message.role === "user" && message.content.trim())?.content ?? "";
-              const personaId = typeof agentContext.memory._personaId === "string" ? agentContext.memory._personaId : "";
+              const personaId =
+                typeof agentContext.memory._personaId === "string" ? agentContext.memory._personaId : "";
               const sourceTextByCharacterId = new Map<string, string>();
               if (personaId && latestUserExpressionSource.trim()) {
                 sourceTextByCharacterId.set(personaId, latestUserExpressionSource);
