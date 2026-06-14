@@ -439,8 +439,11 @@ export function AppShell() {
 
   const showAmbientDecor = isPageActive && !activeChatId && !detailView && !botBrowserOpen && !gameAssetsBrowserOpen;
   const hasDetailView = detailView != null;
+  const trackerPanelModeAvailable =
+    activeChat?.mode === "roleplay" || activeChat?.mode === "visual_novel" || activeChat?.mode === "game";
   const trackerPanelActive = trackerPanelEnabled && trackerPanelOpen;
-  const trackerPanelSurfaceAvailable = !botBrowserOpen && !gameAssetsBrowserOpen && !hasDetailView;
+  const trackerPanelSurfaceAvailable =
+    trackerPanelModeAvailable && !botBrowserOpen && !gameAssetsBrowserOpen && !hasDetailView;
   const trackerPanelVisible = trackerPanelActive && trackerPanelSurfaceAvailable;
   useEffect(() => {
     if (trackerPanelVisible) {
