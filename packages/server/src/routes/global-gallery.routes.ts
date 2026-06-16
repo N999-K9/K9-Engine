@@ -109,20 +109,27 @@ export async function globalGalleryRoutes(app: FastifyInstance) {
     const width = fields?.width?.value ? parseInt(fields.width.value, 10) : undefined;
     const height = fields?.height?.value ? parseInt(fields.height.value, 10) : undefined;
 
-    const image = await storage.createImage({
-      folderId,
-      filePath: `global/${filename}`,
-      prompt,
-      provider,
-      model,
-      width: Number.isFinite(width) ? width : undefined,
-      height: Number.isFinite(height) ? height : undefined,
-    });
+    try {
+      const image = await storage.createImage({
+        folderId,
+        filePath: `global/${filename}`,
+        prompt,
+        provider,
+        model,
+        width: Number.isFinite(width) ? width : undefined,
+        height: Number.isFinite(height) ? height : undefined,
+      });
 
-    return {
-      ...image,
-      url: buildUrl(filename),
-    };
+      return {
+        ...image,
+        url: buildUrl(filename),
+      };
+    } catch (err) {
+      // Roll back the just-written file so a metadata failure can't strand an orphan on disk.
+      if (existsSync(filePath)) unlinkSync(filePath);
+      logger.error(err, "Failed to persist global gallery image %s", filename);
+      return reply.status(500).send({ error: "Failed to save image metadata" });
+    }
   });
 
   app.get<{ Params: { filename: string } }>("/file/:filename", async (req, reply) => {

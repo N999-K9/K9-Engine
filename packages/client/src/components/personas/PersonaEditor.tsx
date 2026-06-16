@@ -208,8 +208,12 @@ function PersonaGalleryTab({ personaId, personaName }: { personaId: string; pers
       ) {
         return;
       }
-      remove.mutate(image.id);
-      if (lightbox?.id === image.id) setLightbox(null);
+      try {
+        await remove.mutateAsync(image.id);
+        if (lightbox?.id === image.id) setLightbox(null);
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to delete persona image.");
+      }
     },
     [lightbox?.id, remove],
   );

@@ -26,6 +26,7 @@ import { DATA_DIR } from "../utils/data-dir.js";
 import { createWriteStream, existsSync, rmSync, unlinkSync } from "fs";
 import { normalizeTimestampOverrides } from "../services/import/import-timestamps.js";
 import { assertInsideDir, extensionFromImageMime, isAllowedImageBuffer } from "../utils/security.js";
+import { logger } from "../lib/logger.js";
 import { importSTLorebook } from "../services/import/st-lorebook.importer.js";
 import AdmZip from "adm-zip";
 import { extname } from "path";
@@ -835,11 +836,17 @@ export async function charactersRoutes(app: FastifyInstance) {
   });
 
   app.delete<{ Params: { id: string } }>("/personas/:id", async (req, reply) => {
-    const galleryDir = join(PERSONA_GALLERY_ROOT, req.params.id);
+    const { id } = req.params;
+    // Reject path-traversal before deriving a filesystem path from the route param —
+    // an id of ".." would otherwise resolve rmSync outside PERSONA_GALLERY_ROOT.
+    if (id.includes("..") || id.includes("/") || id.includes("\\")) {
+      return reply.status(400).send({ error: "Invalid persona id" });
+    }
+    const galleryDir = join(PERSONA_GALLERY_ROOT, id);
     if (existsSync(galleryDir)) {
       rmSync(galleryDir, { recursive: true, force: true });
     }
-    await storage.removePersona(req.params.id);
+    await storage.removePersona(id);
     return reply.status(204).send();
   });
 
@@ -884,27 +891,41 @@ export async function charactersRoutes(app: FastifyInstance) {
     const width = fields?.width?.value ? parseInt(fields.width.value, 10) : undefined;
     const height = fields?.height?.value ? parseInt(fields.height.value, 10) : undefined;
 
-    const image = await personaGallery.create({
-      personaId: id,
-      filePath: `personas/${id}/${filename}`,
-      prompt,
-      provider,
-      model,
-      width: Number.isFinite(width) ? width : undefined,
-      height: Number.isFinite(height) ? height : undefined,
-    });
+    try {
+      const image = await personaGallery.create({
+        personaId: id,
+        filePath: `personas/${id}/${filename}`,
+        prompt,
+        provider,
+        model,
+        width: Number.isFinite(width) ? width : undefined,
+        height: Number.isFinite(height) ? height : undefined,
+      });
 
-    return {
-      ...image,
-      url: `/api/characters/personas/${id}/gallery/file/${encodeURIComponent(filename)}`,
-    };
+      return {
+        ...image,
+        url: `/api/characters/personas/${id}/gallery/file/${encodeURIComponent(filename)}`,
+      };
+    } catch (err) {
+      // Roll back the just-written file so a metadata failure can't strand an orphan on disk.
+      if (existsSync(filePath)) unlinkSync(filePath);
+      logger.error(err, "Failed to persist persona gallery image for %s", id);
+      return reply.status(500).send({ error: "Failed to save image metadata" });
+    }
   });
 
   app.get<{ Params: { id: string; filename: string } }>(
     "/personas/:id/gallery/file/:filename",
     async (req, reply) => {
       const { id, filename } = req.params;
-      if (filename.includes("..") || filename.includes("/") || id.includes("..") || id.includes("/")) {
+      if (
+        filename.includes("..") ||
+        filename.includes("/") ||
+        filename.includes("\\") ||
+        id.includes("..") ||
+        id.includes("/") ||
+        id.includes("\\")
+      ) {
         return reply.status(400).send({ error: "Invalid path" });
       }
 
@@ -924,9 +945,15 @@ export async function charactersRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: "Not found" });
     }
 
-    const filePath = join(DATA_DIR, "gallery", image.filePath);
-    if (existsSync(filePath)) {
-      unlinkSync(filePath);
+    // assertInsideDir guards against a poisoned stored filePath escaping the gallery dir.
+    try {
+      const galleryRoot = join(DATA_DIR, "gallery");
+      const filePath = assertInsideDir(galleryRoot, join(galleryRoot, image.filePath));
+      if (existsSync(filePath)) {
+        unlinkSync(filePath);
+      }
+    } catch (err) {
+      logger.warn(err, "Skipped persona gallery file unlink for %s: path escapes gallery dir", imageId);
     }
 
     await personaGallery.remove(imageId);
