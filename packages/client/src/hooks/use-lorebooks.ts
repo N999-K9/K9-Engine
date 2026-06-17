@@ -362,6 +362,20 @@ export function useReorderLorebookFolders() {
   });
 }
 
+export function useCloneLorebookFolder() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ lorebookId, folderId }: { lorebookId: string; folderId: string }) =>
+      api.post<LorebookFolder>(`/lorebooks/${lorebookId}/folders/${folderId}/clone`),
+    onSuccess: (_data, variables) => {
+      // A clone adds folders AND entries, so refresh both lists + the active scan.
+      qc.invalidateQueries({ queryKey: lorebookKeys.folders(variables.lorebookId) });
+      qc.invalidateQueries({ queryKey: lorebookKeys.entries(variables.lorebookId) });
+      qc.invalidateQueries({ queryKey: lorebookKeys.active() });
+    },
+  });
+}
+
 export function useSearchLorebookEntries(query: string) {
   return useQuery({
     queryKey: lorebookKeys.search(query),

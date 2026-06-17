@@ -19,10 +19,10 @@ import {
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
-import { ChevronDown, Folder, GripVertical, ToggleLeft, ToggleRight, Trash2 } from "lucide-react";
+import { ChevronDown, Copy, Folder, GripVertical, ToggleLeft, ToggleRight, Trash2 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { showConfirmDialog } from "../../lib/app-dialogs";
-import { useUpdateLorebookFolder, useDeleteLorebookFolder } from "../../hooks/use-lorebooks";
+import { useUpdateLorebookFolder, useDeleteLorebookFolder, useCloneLorebookFolder } from "../../hooks/use-lorebooks";
 import { canReparentFolder, type LorebookFolder } from "@marinara-engine/shared";
 
 interface Props {
@@ -70,6 +70,7 @@ export function LorebookFolderRow({
 }: Props) {
   const updateFolder = useUpdateLorebookFolder();
   const deleteFolder = useDeleteLorebookFolder();
+  const cloneFolder = useCloneLorebookFolder();
 
   // Optimistic mirrors so toggle/rename feel snappy while the mutation flushes.
   const [localEnabled, setLocalEnabled] = useState(folder.enabled);
@@ -286,6 +287,21 @@ export function LorebookFolderRow({
         >
           {entryCount}
         </span>
+
+        {/* Clone — deep-copies the folder, its entries, and its sub-folders */}
+        <button
+          type="button"
+          aria-label="Clone folder"
+          title="Clone this folder, its entries, and its sub-folders"
+          disabled={cloneFolder.isPending}
+          onClick={(e) => {
+            e.stopPropagation();
+            cloneFolder.mutate({ lorebookId, folderId: folder.id });
+          }}
+          className="shrink-0 rounded p-1 opacity-0 transition-all hover:bg-[var(--accent)] group-hover:opacity-100 max-md:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Copy size="0.75rem" className="text-[var(--muted-foreground)]" />
+        </button>
 
         {/* Delete (hover-revealed on desktop, always visible on mobile per the row-action convention) */}
         <button

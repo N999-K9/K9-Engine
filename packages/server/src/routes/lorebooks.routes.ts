@@ -587,6 +587,16 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     return reply.status(204).send();
   });
 
+  app.post<{ Params: { id: string; folderId: string } }>("/:id/folders/:folderId/clone", async (req, reply) => {
+    // Deep-clone the folder, its entries, and its whole sub-folder subtree into
+    // the same lorebook. Scoped by lorebookId so /lorebooks/A/folders/B can't
+    // clone a folder that belongs to lorebook X.
+    const existing = await storage.getFolder(req.params.folderId, req.params.id);
+    if (!existing) return reply.status(404).send({ error: "Folder not found" });
+    const created = await storage.cloneFolder(req.params.folderId, req.params.id);
+    return reply.status(201).send(created);
+  });
+
   app.put<{ Params: { id: string } }>("/:id/folders/reorder", async (req, reply) => {
     const body = req.body as { folderIds?: unknown };
     const folderIds = Array.isArray(body.folderIds)
