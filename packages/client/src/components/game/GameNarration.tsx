@@ -960,7 +960,10 @@ export function GameNarration({
 }: GameNarrationProps) {
   const { translations, translating } = useTranslate();
   const { applyToAIOutput } = useApplyRegex();
-  const scopedRegexMode = useChatStore((s) => parseChatMetadata(s.activeChat?.metadata).scopedRegexMode);
+  // Parse the chat metadata in a memo (not the store selector) so streaming ticks
+  // don't re-parse the whole metadata object on every update.
+  const activeChatMetadata = useChatStore((s) => s.activeChat?.metadata);
+  const scopedRegexMode = useMemo(() => parseChatMetadata(activeChatMetadata).scopedRegexMode, [activeChatMetadata]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [visibleChars, setVisibleChars] = useState(0);
   const [logsOpen, setLogsOpen] = useState(false);

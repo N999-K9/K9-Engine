@@ -1199,7 +1199,10 @@ export const ChatMessage = memo(function ChatMessage({
   // Apply regex scripts to AI output (assistant/narrator roles)
   const { applyToAIOutput } = useApplyRegex();
   // Per-chat scoped-regex mode — gates character-scoped scripts at display time.
-  const scopedRegexMode = useChatStore((s) => parseChatMetadata(s.activeChat?.metadata).scopedRegexMode);
+  // Select the raw metadata (stable while tokens stream) and parse it in a memo so
+  // we don't JSON-parse the whole chat metadata on every store tick during streaming.
+  const activeChatMetadata = useChatStore((s) => s.activeChat?.metadata);
+  const scopedRegexMode = useMemo(() => parseChatMetadata(activeChatMetadata).scopedRegexMode, [activeChatMetadata]);
 
   const scopedCharacterMap = useMemo(() => {
     if (!characterMap) return null;
