@@ -951,10 +951,12 @@ class FileTableStore {
           executable(async () => {
             const target = this.rows(meta.name);
             let changed = false;
-            this.recordTxMutation(meta.name);
             target.forEach((row, index) => {
               const ctx = this.contextForRow(meta, row, index);
               if (!evaluateCondition(condition, ctx)) return;
+              // Snapshot lazily, just before the first actual row mutation, so an
+              // update whose WHERE matches nothing never clones the table.
+              this.recordTxMutation(meta.name);
               for (const [key, value] of Object.entries(patch)) {
                 const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
                 row[column?.key ?? key] = resolveValue(value, ctx);
