@@ -56,6 +56,7 @@ import { createCustomToolsStorage } from "../services/storage/custom-tools.stora
 import { createLorebooksStorage } from "../services/storage/lorebooks.storage.js";
 import { createRegexScriptsStorage } from "../services/storage/regex-scripts.storage.js";
 import { createCustomEmojisStorage } from "../services/storage/custom-emojis.storage.js";
+import { createCustomStickersStorage } from "../services/storage/custom-stickers.storage.js";
 import { createCharacterGalleryStorage } from "../services/storage/character-gallery.storage.js";
 import { localEmbed, isLocalEmbedderAvailable } from "../services/local-embedder.js";
 import { cosineSimilarity } from "../services/lorebook/embeddings.js";
@@ -897,6 +898,45 @@ function buildCustomEmojiAdvertisement(
   return `${lead}\nBeyond the full standard emoji set, these custom emojis are available (use by typing :name:):\n${lines.join("\n")}`;
 }
 
+/**
+ * Build the Conversation-mode system-prompt block telling the responding
+ * character(s) which custom stickers they may send (`sticker:name:`, a block
+ * image). Mirrors the emoji advertisement: own gallery stickers first, then the
+ * global pool, capped at maxCount; pools arrive pre-ordered by the selection mode.
+ * Returns null when there are no stickers to advertise.
+ */
+function buildCustomStickerAdvertisement(
+  responders: { charId: string; name: string }[],
+  orderedGlobal: string[],
+  orderedOwnByChar: Map<string, string[]>,
+  maxCount: number,
+): string | null {
+  const toTokens = (names: string[]) => names.map((name) => `sticker:${name}:`).join(" ");
+  const lead =
+    "You can send a sticker by writing its name as sticker:name: — it posts as a large block image on its own line. Send one only when it genuinely fits the moment, not in every message.";
+
+  if (responders.length === 1) {
+    const merged = [...(orderedOwnByChar.get(responders[0]!.charId) ?? [])];
+    for (const name of orderedGlobal) {
+      if (merged.length >= maxCount) break;
+      if (!merged.includes(name)) merged.push(name);
+    }
+    const capped = merged.slice(0, maxCount);
+    if (capped.length === 0) return null;
+    return `${lead}\nAvailable stickers: ${toTokens(capped)}`;
+  }
+
+  const lines: string[] = [];
+  const global = orderedGlobal.slice(0, maxCount);
+  if (global.length > 0) lines.push(`Available to everyone: ${toTokens(global)}`);
+  for (const responder of responders) {
+    const own = (orderedOwnByChar.get(responder.charId) ?? []).slice(0, maxCount);
+    if (own.length > 0) lines.push(`${responder.name} also has: ${toTokens(own)}`);
+  }
+  if (lines.length === 0) return null;
+  return `${lead}\nAvailable stickers (send by writing sticker:name:):\n${lines.join("\n")}`;
+}
+
 export async function generateRoutes(app: FastifyInstance) {
   const isDebug = logger.isLevelEnabled("debug");
 
@@ -910,6 +950,7 @@ export async function generateRoutes(app: FastifyInstance) {
   const lorebooksStore = createLorebooksStorage(app.db);
   const regexScriptsStore = createRegexScriptsStorage(app.db);
   const customEmojisStore = createCustomEmojisStorage(app.db);
+  const customStickersStore = createCustomStickersStorage(app.db);
   const characterGallery = createCharacterGalleryStorage(app.db);
 
   /**
@@ -2480,13 +2521,19 @@ export async function generateRoutes(app: FastifyInstance) {
           // ── Custom emojis: advertise the available :name: emojis to the responding character(s) ──
           if (chatMode === "conversation") {
             const allGlobalEmojiNames = (await customEmojisStore.list()).map((emoji) => emoji.name);
+            const allGlobalStickerNames = (await customStickersStore.list()).map((sticker) => sticker.name);
             const ownEmojisByChar = new Map<string, string[]>();
+            const ownStickersByChar = new Map<string, string[]>();
             for (const info of respondingConvoCharInfo) {
               const images = await characterGallery.listByCharacterId(info.charId);
-              const names = images
+              const emojiNames = images
                 .filter((img) => img.customKind === "emoji" && img.customName)
                 .map((img) => img.customName as string);
-              if (names.length > 0) ownEmojisByChar.set(info.charId, names);
+              const stickerNames = images
+                .filter((img) => img.customKind === "sticker" && img.customName)
+                .map((img) => img.customName as string);
+              if (emojiNames.length > 0) ownEmojisByChar.set(info.charId, emojiNames);
+              if (stickerNames.length > 0) ownStickersByChar.set(info.charId, stickerNames);
             }
             if (allGlobalEmojiNames.length > 0 || ownEmojisByChar.size > 0) {
               const emojiPrefs = normalizeCustomEmojiSelection(chatMeta.customEmojiSelection);
@@ -2531,6 +2578,24 @@ export async function generateRoutes(app: FastifyInstance) {
               }
 
               if (emojiAdvertisement) conversationSystemPrompt += "\n\n" + emojiAdvertisement;
+            }
+
+            // Stickers reuse the same selection prefs/ordering (random/semantic; tool-call falls back to semantic).
+            if (allGlobalStickerNames.length > 0 || ownStickersByChar.size > 0) {
+              const stickerPrefs = normalizeCustomEmojiSelection(chatMeta.customEmojiSelection);
+              const stickerQuery = typeof input.userMessage === "string" ? input.userMessage : "";
+              const orderedGlobal = await orderEmojiNames(allGlobalStickerNames, stickerPrefs, stickerQuery);
+              const orderedOwnByChar = new Map<string, string[]>();
+              for (const [charId, names] of ownStickersByChar) {
+                orderedOwnByChar.set(charId, await orderEmojiNames(names, stickerPrefs, stickerQuery));
+              }
+              const stickerAdvertisement = buildCustomStickerAdvertisement(
+                respondingConvoCharInfo,
+                orderedGlobal,
+                orderedOwnByChar,
+                stickerPrefs.maxCount,
+              );
+              if (stickerAdvertisement) conversationSystemPrompt += "\n\n" + stickerAdvertisement;
             }
           }
 
