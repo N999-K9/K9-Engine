@@ -211,7 +211,7 @@ export function resolveSelectiveLogic(value: unknown): "and" | "or" | "not" {
   return logicMap[typeof value === "number" ? value : 0] ?? "and";
 }
 
-export function resolvePosition(value: STWorldInfoEntry["position"]): number {
+export function resolvePosition(value: unknown): number {
   if (typeof value === "string") {
     if (value === "after_char") return 1;
     if (value === "at_depth" || value === "depth") return 2;
