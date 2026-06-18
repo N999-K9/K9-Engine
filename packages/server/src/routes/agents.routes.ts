@@ -29,6 +29,7 @@ const secretPlotArcSchema = z
   .object({
     description: z.string().optional(),
     protagonistArc: z.string().optional(),
+    characterArc: z.string().optional(),
     completed: z.boolean().optional(),
   })
   .passthrough();
@@ -324,17 +325,20 @@ export async function agentsRoutes(app: FastifyInstance) {
   app.delete<{ Params: { chatId: string } }>("/runs/:chatId", async (req, reply) => {
     const chatId = req.params.chatId;
 
-    // Before wiping all memory, preserve the secret-plot-driver's overarching arc.
-    // Scene directions + pacing are cleared (ephemeral per-generation), but the arc
-    // is a long-term structure that only clears when the agent is removed from the chat.
-    let preservedArc: unknown = null;
-    let secretPlotConfigId: string | null = null;
+    // Before wiping all memory, preserve Narrative Director's secret plot arc.
+    // The arc is long-term structure that only clears when the Director is removed from the chat.
+    let preservedArc: unknown;
+    let preservedConfigId: string | null = null;
     try {
-      const secretPlotConfig = await storage.getByType("secret-plot-driver");
-      if (secretPlotConfig) {
-        secretPlotConfigId = secretPlotConfig.id;
-        const mem = await storage.getMemory(secretPlotConfigId, chatId);
-        if (mem.overarchingArc) preservedArc = mem.overarchingArc;
+      for (const type of ["director", "secret-plot-driver"]) {
+        const config = await storage.getByType(type);
+        if (!config) continue;
+        const mem = await storage.getMemory(config.id, chatId);
+        if (mem.overarchingArc !== undefined && mem.overarchingArc !== null) {
+          preservedArc = mem.overarchingArc;
+          preservedConfigId = config.id;
+          break;
+        }
       }
     } catch {
       /* non-critical */
@@ -344,9 +348,9 @@ export async function agentsRoutes(app: FastifyInstance) {
     await storage.clearMemoryForChat(chatId);
 
     // Restore the overarching arc
-    if (preservedArc && secretPlotConfigId) {
+    if (preservedArc !== undefined && preservedConfigId) {
       try {
-        await storage.setMemory(secretPlotConfigId, chatId, "overarchingArc", preservedArc);
+        await storage.setMemory(preservedConfigId, chatId, "overarchingArc", preservedArc);
       } catch {
         /* non-critical */
       }
@@ -381,7 +385,10 @@ export async function agentsRoutes(app: FastifyInstance) {
     }
     let normalizedPatch: Record<string, unknown>;
     try {
-      normalizedPatch = req.params.agentType === "secret-plot-driver" ? normalizeSecretPlotMemoryPatch(patch) : patch;
+      normalizedPatch =
+        req.params.agentType === "director" || req.params.agentType === "secret-plot-driver"
+          ? normalizeSecretPlotMemoryPatch(patch)
+          : patch;
     } catch (err) {
       if (err instanceof z.ZodError) {
         return reply.status(400).send({

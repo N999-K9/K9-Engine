@@ -50,6 +50,12 @@ export interface ChatMessage {
   tool_calls?: LLMToolCall[];
   /** Base64 data URLs for multimodal image inputs */
   images?: string[];
+  /** Base64 data URLs for provider-native file/document inputs */
+  files?: Array<{
+    type: string;
+    data: string;
+    filename?: string;
+  }>;
   /** Provider-specific metadata (e.g. Gemini parts with thought signatures) */
   providerMetadata?: Record<string, unknown>;
 }
@@ -167,6 +173,7 @@ type ContextFitOptions = Pick<ChatOptions, "maxContext" | "maxTokens" | "tools" 
 const CHARS_PER_TOKEN = 4;
 const MESSAGE_OVERHEAD_TOKENS = 6;
 const IMAGE_TOKEN_ESTIMATE = 256;
+const MIN_FILE_TOKEN_ESTIMATE = 1_500;
 const CONTEXT_SAFETY_MARGIN_TOKENS = 64;
 const CONTEXT_SAFETY_MARGIN_RATIO = 0.02;
 const MIN_INPUT_BUDGET_TOKENS = 128;
@@ -178,6 +185,13 @@ const TRUNCATION_MARKER = "\n\n[Truncated to fit context window]";
 function normalizePositiveInteger(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
   return Math.floor(value);
+}
+
+function estimateFileTokens(file: { data: string }): number {
+  const raw = file.data.includes(",") ? (file.data.split(",", 2)[1] ?? "") : file.data;
+  const approxBytes = Math.floor((raw.length * 3) / 4);
+  const sizeBased = Math.ceil(approxBytes / 3);
+  return Math.max(MIN_FILE_TOKEN_ESTIMATE, sizeBased);
 }
 
 function minDefined(...values: Array<number | undefined>): number | undefined {
@@ -221,6 +235,9 @@ function estimateMessageTokens(message: ChatMessage): number {
   if (message.images?.length) {
     total += message.images.length * IMAGE_TOKEN_ESTIMATE;
   }
+  if (message.files?.length) {
+    total += message.files.reduce((sum, file) => sum + estimateFileTokens(file), 0);
+  }
   if (message.providerMetadata) {
     total += Math.min(estimateStructuredTokens(message.providerMetadata), 512);
   }
@@ -235,6 +252,7 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((message) => ({
     ...message,
     ...(message.images ? { images: [...message.images] } : {}),
+    ...(message.files ? { files: message.files.map((file) => ({ ...file })) } : {}),
     ...(message.tool_calls
       ? { tool_calls: message.tool_calls.map((call) => ({ ...call, function: { ...call.function } })) }
       : {}),
