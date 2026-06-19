@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  LOCAL_SIDECAR_CONNECTION_ID,
   PROFESSOR_MARI_ID,
   type APIConnection,
   type Chat,
@@ -48,6 +49,7 @@ import { lorebookKeys } from "../../hooks/use-lorebooks";
 import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
 import { api } from "../../lib/api-client";
 import { useChatStore } from "../../stores/chat.store";
+import { useSidecarStore } from "../../stores/sidecar.store";
 import { useUIStore } from "../../stores/ui.store";
 import { applyInlineMarkdown, renderMarkdownBlocks } from "../../lib/markdown";
 import { cn } from "../../lib/utils";
@@ -87,6 +89,14 @@ type SkillDraftState = {
   name: string;
   description: string;
   content: string;
+};
+
+type ProfessorMariConnectionOption = {
+  id: string;
+  name: string;
+  model?: string | null;
+  provider?: string;
+  isDefault?: boolean;
 };
 
 const LOREBOOK_WORKSPACE_TABLES = new Set([
@@ -1464,6 +1474,9 @@ export function HomeProfessorMariChat({
 }) {
   const qc = useQueryClient();
   const { data: connectionsRaw, isLoading: connectionsLoading } = useConnections();
+  const sidecarModelDownloaded = useSidecarStore((state) => state.modelDownloaded);
+  const sidecarModelDisplayName = useSidecarStore((state) => state.modelDisplayName);
+  const fetchSidecarStatus = useSidecarStore((state) => state.fetchStatus);
   const trackAchievement = useTrackAchievement();
   const [chatId, setChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -1498,19 +1511,29 @@ export function HomeProfessorMariChat({
   const hasActiveGeneration = useChatStore((state) => (chatId ? state.abortControllers.has(chatId) : false));
   const mariPhase = useChatStore((state) => (chatId ? (state.mariPhaseByChatId.get(chatId) ?? null) : null));
 
-  const languageConnections = useMemo(
+  const languageConnections = useMemo<ProfessorMariConnectionOption[]>(
     () => filterLanguageGenerationConnections((connectionsRaw ?? []) as APIConnection[]),
     [connectionsRaw],
   );
+  const connectionOptions = useMemo<ProfessorMariConnectionOption[]>(() => {
+    if (!sidecarModelDownloaded) return languageConnections;
+    return [
+      ...languageConnections,
+      {
+        id: LOCAL_SIDECAR_CONNECTION_ID,
+        name: sidecarModelDisplayName ? `Local Model (${sidecarModelDisplayName})` : "Local Model (sidecar)",
+        model: sidecarModelDisplayName ?? "local-sidecar",
+        provider: "local_sidecar",
+        isDefault: languageConnections.length === 0,
+      },
+    ];
+  }, [languageConnections, sidecarModelDisplayName, sidecarModelDownloaded]);
   const selectedConnection = useMemo(
-    () => languageConnections.find((connection) => connection.id === selectedConnectionId) ?? null,
-    [languageConnections, selectedConnectionId],
+    () => connectionOptions.find((connection) => connection.id === selectedConnectionId) ?? null,
+    [connectionOptions, selectedConnectionId],
   );
   const effectiveConnection =
-    selectedConnection ??
-    languageConnections.find((connection) => connection.isDefault) ??
-    languageConnections[0] ??
-    null;
+    selectedConnection ?? connectionOptions.find((connection) => connection.isDefault) ?? connectionOptions[0] ?? null;
   const effectiveConnectionId = effectiveConnection?.id ?? null;
   const isBusy = sending || hasActiveGeneration || workspaceActive;
   const selectedSkill = useMemo(
@@ -1570,6 +1593,10 @@ export function HomeProfessorMariChat({
   }, [invalidateLorebookWorkspaceData, qc]);
 
   useEffect(() => {
+    void fetchSidecarStatus();
+  }, [fetchSidecarStatus]);
+
+  useEffect(() => {
     const appliedLorebookChanges = (workspaceStatus?.history ?? []).filter((entry) => {
       if (entry.status !== "approved") return false;
       if (!workspaceHistoryTouchesLorebooks(entry)) return false;
@@ -1585,19 +1612,18 @@ export function HomeProfessorMariChat({
   }, [invalidateLorebookWorkspaceData, workspaceStatus?.history]);
 
   useEffect(() => {
-    if (languageConnections.length === 0) {
+    if (connectionOptions.length === 0) {
       setSelectedConnectionId(null);
       return;
     }
 
     setSelectedConnectionId((current) => {
-      if (current && languageConnections.some((connection) => connection.id === current)) return current;
-      const next =
-        languageConnections.find((connection) => connection.isDefault)?.id ?? languageConnections[0]?.id ?? null;
+      if (current && connectionOptions.some((connection) => connection.id === current)) return current;
+      const next = connectionOptions.find((connection) => connection.isDefault)?.id ?? connectionOptions[0]?.id ?? null;
       if (next) rememberConnectionId(next);
       return next;
     });
-  }, [languageConnections]);
+  }, [connectionOptions]);
 
   useEffect(() => {
     if (hasLoadedRef.current || connectionsLoading) return;
@@ -2272,8 +2298,8 @@ export function HomeProfessorMariChat({
                             Connections
                           </div>
                           <div className="overflow-y-auto p-1">
-                            {languageConnections.length > 0 ? (
-                              languageConnections.map((connection) => {
+                            {connectionOptions.length > 0 ? (
+                              connectionOptions.map((connection) => {
                                 const isActive = effectiveConnectionId === connection.id;
                                 return (
                                   <button
@@ -2285,7 +2311,14 @@ export function HomeProfessorMariChat({
                                       isActive && "font-semibold text-[var(--foreground)]",
                                     )}
                                   >
-                                    <span className="min-w-0 flex-1 truncate">{connection.name || connection.id}</span>
+                                    <span className="min-w-0 flex-1 truncate">
+                                      {connection.name || connection.id}
+                                      {connection.id === LOCAL_SIDECAR_CONNECTION_ID && (
+                                        <span className="ml-1 text-[0.625rem] font-normal text-[var(--muted-foreground)]">
+                                          JSON tools
+                                        </span>
+                                      )}
+                                    </span>
                                     {isActive && <Check size="0.75rem" className="shrink-0 text-[var(--primary)]" />}
                                   </button>
                                 );
