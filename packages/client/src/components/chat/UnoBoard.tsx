@@ -6,13 +6,10 @@
 // seat's count, and the player's own hand with legal-move gating. Cards are
 // pure CSS/SVG (no image assets), so they scale crisply and theme cleanly.
 import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { ArrowRightLeft, Gamepad2, RotateCw, X } from "lucide-react";
+import { ArrowRightLeft, RotateCw, X } from "lucide-react";
 import type { UnoCard, UnoColor } from "@marinara-engine/shared";
 import { useChatStore } from "../../stores/chat.store";
 import { useUnoGameStore } from "../../stores/uno-game.store";
-import { chatKeys } from "../../hooks/use-chats";
-import { getChatCharacterIds } from "../../lib/chat-macros";
 import { useResignUno, useUnoMove, useUnoState } from "../../hooks/use-uno";
 import { UnoSetup } from "./UnoSetup";
 
@@ -76,7 +73,8 @@ export function UnoBoard({ chatId }: Props) {
   const streaming = useChatStore((s) => s.isStreaming);
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreaming = streaming && streamingChatId === chatId;
-  const qc = useQueryClient();
+  const setupChatId = useUnoGameStore((s) => s.setupChatId);
+  const closeSetup = useUnoGameStore((s) => s.closeSetup);
   const move = useUnoMove(chatId);
   const resign = useResignUno(chatId);
 
@@ -85,11 +83,9 @@ export function UnoBoard({ chatId }: Props) {
   useUnoState(active ? null : chatId);
 
   const [pending, setPending] = useState<{ card: UnoCard; kind: "color" | "swap" } | null>(null);
-  const [setupOpen, setSetupOpen] = useState(false);
-  useEffect(() => {
-    setPending(null);
-    setSetupOpen(false);
-  }, [chatId]);
+  useEffect(() => setPending(null), [chatId]);
+
+  const setup = <UnoSetup chatId={chatId} open={setupChatId === chatId} onClose={closeSetup} />;
 
   const view = active ? current : null;
   const disabled = isStreaming || move.isPending || resign.isPending;
@@ -97,27 +93,8 @@ export function UnoBoard({ chatId }: Props) {
   const isMyTurn = !!view && view.currentSeatId === view.yourSeatId;
   const jumpInSet = useMemo(() => new Set(view?.jumpInCardIds ?? []), [view]);
 
-  if (!view) {
-    // No active game — offer a launcher when the chat has at least one bot character.
-    const chat = qc.getQueryData<{ characterIds?: unknown }>(chatKeys.detail(chatId));
-    if (getChatCharacterIds(chat).length < 1) return null;
-    return (
-      <>
-        <div className="mx-2 mb-1 flex justify-end">
-          <button
-            type="button"
-            onClick={() => setSetupOpen(true)}
-            className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-xs font-medium text-[var(--muted-foreground)] shadow-sm transition-colors hover:text-[var(--foreground)]"
-            title="Start a game of UNO with the characters in this chat"
-          >
-            <Gamepad2 className="h-3.5 w-3.5" />
-            Play UNO
-          </button>
-        </div>
-        <UnoSetup chatId={chatId} open={setupOpen} onClose={() => setSetupOpen(false)} />
-      </>
-    );
-  }
+  // No active game: render only the (usually-hidden) setup modal, opened via /uno.
+  if (!view) return setup;
 
   const submit = (m: Record<string, unknown>) => {
     if (disabled) return;
@@ -348,6 +325,7 @@ export function UnoBoard({ chatId }: Props) {
           </button>
         </div>
       )}
+      {setup}
     </div>
   );
 }

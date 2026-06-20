@@ -24,6 +24,7 @@ import { toast } from "sonner";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useChatStore } from "../../stores/chat.store";
 import { useUIStore } from "../../stores/ui.store";
+import { useUnoGameStore } from "../../stores/uno-game.store";
 import { useGenerate } from "../../hooks/use-generate";
 import { useApplyRegex } from "../../hooks/use-apply-regex";
 import { useCreateMessage, useDeleteMessage, useUpdateMessageExtra, useChat, chatKeys } from "../../hooks/use-chats";
@@ -699,6 +700,16 @@ export function ConversationInput({
         toast.error(msg);
       }
       return;
+    }
+
+    // Natural-language launcher: "let's play uno" opens the game setup. The message
+    // still sends normally, so the characters can react to the suggestion too.
+    {
+      const activeUno = useUnoGameStore.getState().current;
+      const unoActive = !!activeUno && activeUno.chatId === activeChatId && activeUno.status !== "finished";
+      if (!unoActive && /\b(?:play|start)\b[^.!?\n]{0,16}\buno\b/i.test(raw)) {
+        useUnoGameStore.getState().openSetup(activeChatId);
+      }
     }
 
     const activeChat = useChatStore.getState().activeChat;
