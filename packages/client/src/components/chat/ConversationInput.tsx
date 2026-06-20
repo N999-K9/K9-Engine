@@ -102,8 +102,8 @@ function isConversationHiddenSlashCommand(command: SlashCommand): boolean {
 function quoteSlashArgument(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  if (!/[\s"]/u.test(trimmed)) return trimmed;
-  return `"${trimmed.replace(/"/g, '\\"')}"`;
+  if (!/[\s"\\]/u.test(trimmed)) return trimmed;
+  return `"${trimmed.replace(/["\\]/g, "\\$&")}"`;
 }
 
 function buildSlashCommandPrefill(

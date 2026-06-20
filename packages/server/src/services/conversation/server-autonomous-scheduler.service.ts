@@ -179,6 +179,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     if (recentPresence) return;
 
     runningChats.add(chat.id);
+    let generationStartedAt: number | undefined;
     try {
       const checkResponse = await app.inject({
         method: "POST",
@@ -201,6 +202,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
       }
 
       const result = JSON.parse(checkResponse.payload) as AutonomousCheckResult;
+      generationStartedAt = result.generationStartedAt;
       const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
       if (!characterId) return;
 
@@ -219,18 +221,18 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
           await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
           const recentPresenceAfterDelay = getRecentAutonomousClientPresence(chat.id, RECENT_CLIENT_PRESENCE_MS);
           if (recentPresenceAfterDelay) {
-            clearGenerationInProgress(chat.id, result.generationStartedAt);
+            clearGenerationInProgress(chat.id, generationStartedAt);
             return;
           }
         }
       }
 
-      const generated = await generateAutonomousMessage(chat.id, characterId, schedule, freshMeta, result.generationStartedAt);
+      const generated = await generateAutonomousMessage(chat.id, characterId, schedule, freshMeta, generationStartedAt);
       if (generated) {
         logger.info("[autonomous-scheduler] Generated autonomous message for chat %s", chat.id);
       }
     } catch (err) {
-      clearGenerationInProgress(chat.id, undefined);
+      clearGenerationInProgress(chat.id, generationStartedAt);
       logger.warn(err, "[autonomous-scheduler] Failed while evaluating chat %s", chat.id);
     } finally {
       runningChats.delete(chat.id);

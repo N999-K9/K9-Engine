@@ -274,10 +274,28 @@ export function ConversationPresenceCard({
     enabled: !!chatId && chatCharIds.length > 0,
     refetchInterval: () => (document.hidden ? false : 60_000),
   });
+  const statusInvalidationSignature = useMemo(() => {
+    const statuses = statusesQuery.data?.statuses;
+    if (!statuses) return null;
+    return Object.keys(statuses)
+      .sort()
+      .map((id) => {
+        const entry = statuses[id];
+        return `${id}:${entry?.status ?? ""}:${entry?.activity ?? ""}`;
+      })
+      .join("|");
+  }, [statusesQuery.data?.statuses]);
+  const lastStatusInvalidationSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (statusesQuery.data) queryClient.invalidateQueries({ queryKey: characterKeys.list() });
-  }, [queryClient, statusesQuery.data]);
+    if (!statusInvalidationSignature) {
+      lastStatusInvalidationSignatureRef.current = null;
+      return;
+    }
+    if (lastStatusInvalidationSignatureRef.current === statusInvalidationSignature) return;
+    lastStatusInvalidationSignatureRef.current = statusInvalidationSignature;
+    queryClient.invalidateQueries({ queryKey: characterKeys.list() });
+  }, [queryClient, statusInvalidationSignature]);
 
   useLayoutEffect(() => {
     if (!open || !buttonRef.current) return;
@@ -806,16 +824,16 @@ export function ConversationPresenceCard({
                                           {block.label}
                                         </div>
                                       ) : null}
-                                      <div className="grid min-w-0 grid-cols-[auto_9.5rem_minmax(0,1fr)] items-start gap-x-2">
+                                      <div className="grid min-w-0 grid-cols-[auto_6.75rem_minmax(0,1fr)] items-start gap-x-2">
                                         <span
                                           className={cn(
                                             "mt-[0.4rem] h-1.5 w-1.5 shrink-0 rounded-full",
                                             statusDotClass(block.status),
                                           )}
                                         />
-                                        <span className="w-full rounded-full bg-[var(--foreground)]/6 px-1.5 py-0.5 text-center text-[0.5625rem] tabular-nums text-[var(--muted-foreground)]/78 ring-1 ring-[var(--border)]/45">
-                                          {formatScheduleTimeRange(block.time)}
-                                        </span>
+                                          <span className="justify-self-start rounded-full bg-[var(--foreground)]/6 px-1.5 py-0.5 text-center text-[0.5625rem] tabular-nums text-[var(--muted-foreground)]/78 ring-1 ring-[var(--border)]/45">
+                                            {formatScheduleTimeRange(block.time)}
+                                          </span>
                                         <div className="min-w-0 flex-1 whitespace-pre-wrap break-words pt-[0.05rem] text-[0.625rem] leading-4 text-[var(--muted-foreground)]/82">
                                           {block.activity}
                                         </div>

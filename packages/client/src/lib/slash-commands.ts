@@ -55,8 +55,8 @@ export interface SlashCommandContext {
 function quoteCommandArgument(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  if (!/[\s"]/u.test(trimmed)) return trimmed;
-  return `"${trimmed.replace(/"/g, '\\"')}"`;
+  if (!/[\s"\\]/u.test(trimmed)) return trimmed;
+  return `"${trimmed.replace(/["\\]/g, "\\$&")}"`;
 }
 
 function formatAvailableCharacterList(characters: Array<{ id: string; name: string }>): string {
@@ -973,8 +973,9 @@ export function matchSlashCommand(input: string): { command: SlashCommand; args:
 /** Get all commands that match a partial prefix (for autocomplete). */
 export function getSlashCompletions(partial: string): SlashCommand[] {
   if (!partial.startsWith("/")) return [];
-  const prefix = partial.slice(1).trim().toLowerCase();
-  if (prefix.includes(" ")) return [];
+  const rawPrefix = partial.slice(1);
+  if (rawPrefix.includes(" ")) return [];
+  const prefix = rawPrefix.trim().toLowerCase();
   if (!prefix) return COMMANDS;
   return COMMANDS.filter((c) => c.name.startsWith(prefix) || c.aliases?.some((a) => a.startsWith(prefix)));
 }

@@ -1049,6 +1049,10 @@ function buildGlobalCustomEmojiUrl(filePath: string): string {
   return `/api/custom-emojis/file/${encodeURIComponent(filePath)}`;
 }
 
+function buildConversationCustomEmojiKey(scope: "global" | "persona" | "character", scopeId: string | null, name: string): string {
+  return scopeId ? `${scope}:${scopeId}:${name}` : `${scope}:${name}`;
+}
+
 function getStoredFilename(filePath: string): string {
   return filePath.split("/").pop() ?? filePath;
 }
@@ -2036,9 +2040,9 @@ export async function generateRoutes(app: FastifyInstance) {
           });
         }
 
-        // ── Conversation mode: inject built-in DM-style system prompt when no preset ──
+        // ── Conversation mode: inject built-in DM-style system prompt ──
         let convoAwarenessBlock: string | null = null;
-        if (!presetId && chatMode === "conversation") {
+        if (chatMode === "conversation") {
           // Gather character names and status for the prompt.
           // If schedules exist in chat metadata, derive status dynamically.
           const schedules: Record<string, import("../services/conversation/schedule.service.js").WeekSchedule> =
@@ -3562,14 +3566,17 @@ export async function generateRoutes(app: FastifyInstance) {
           ]);
           for (const emoji of globalEmojiRows) {
             if (emoji.name && emoji.filePath) {
-              conversationCustomEmojiUrlByName.set(String(emoji.name), buildGlobalCustomEmojiUrl(String(emoji.filePath)));
+              conversationCustomEmojiUrlByName.set(
+                buildConversationCustomEmojiKey("global", null, String(emoji.name)),
+                buildGlobalCustomEmojiUrl(String(emoji.filePath)),
+              );
             }
           }
           if (personaId) {
             for (const img of personaAssetRows) {
               if (img.customKind === "emoji" && img.customName && img.filePath) {
                 conversationCustomEmojiUrlByName.set(
-                  img.customName,
+                  buildConversationCustomEmojiKey("persona", personaId, img.customName),
                   buildPersonaGalleryEmojiUrl(personaId, getStoredFilename(String(img.filePath))),
                 );
               }
@@ -8799,23 +8806,6 @@ export async function generateRoutes(app: FastifyInstance) {
                           await chars.update(characterId, { extensions } as any);
                         }
 
-                        // Sync to other chats with this character
-                        const allChatsList = await chats.list();
-                        for (const c of allChatsList) {
-                          if (c.id === input.chatId || c.mode !== "conversation") continue;
-                          const cCharIds: string[] =
-                            typeof c.characterIds === "string"
-                              ? JSON.parse(c.characterIds as string)
-                              : (c.characterIds as string[]);
-                          if (!cCharIds.includes(characterId)) continue;
-                          const cMeta =
-                            typeof c.metadata === "string" ? JSON.parse(c.metadata as string) : (c.metadata ?? {});
-                          if (!areConversationSchedulesEnabled(cMeta)) continue;
-                          const cScheds = cMeta.characterSchedules ?? {};
-                          cScheds[characterId] = schedule;
-                          await chats.updateMetadata(c.id, { ...cMeta, characterSchedules: cScheds });
-                        }
-
                         reply.raw.write(
                           `data: ${JSON.stringify({
                             type: "schedule_updated",
@@ -9273,7 +9263,15 @@ export async function generateRoutes(app: FastifyInstance) {
                       let imageUrl: string | null = null;
                       const customName = reactCmd.emoji.match(/^:([a-zA-Z0-9_]+):$/)?.[1];
                       if (customName) {
-                        imageUrl = conversationCustomEmojiUrlByName.get(customName) ?? null;
+                        const emojiLookupKeys = [
+                          characterId ? buildConversationCustomEmojiKey("character", characterId, customName) : null,
+                          personaId ? buildConversationCustomEmojiKey("persona", personaId, customName) : null,
+                          buildConversationCustomEmojiKey("global", null, customName),
+                        ].filter((key): key is string => Boolean(key));
+                        for (const key of emojiLookupKeys) {
+                          imageUrl = conversationCustomEmojiUrlByName.get(key) ?? null;
+                          if (imageUrl) break;
+                        }
                         if (!imageUrl) {
                           const row = await customEmojisStore.getByName(customName);
                           if (row?.filePath) imageUrl = buildGlobalCustomEmojiUrl(String(row.filePath));

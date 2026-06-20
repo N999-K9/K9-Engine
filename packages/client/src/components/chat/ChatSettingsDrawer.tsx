@@ -4048,6 +4048,10 @@ export function ChatSettingsDrawer({
                   onClick={() => {
                     const nextEnabled = !conversationSchedulesEnabled;
                     if (nextEnabled && !hasGeneratedConversationSchedules) {
+                      if (chatCharIds.length === 0) {
+                        updateMeta.mutate({ id: chat.id, conversationSchedulesEnabled: nextEnabled });
+                        return;
+                      }
                       void generateConversationSchedules(false);
                       return;
                     }

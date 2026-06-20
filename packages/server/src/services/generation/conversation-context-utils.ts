@@ -9,8 +9,14 @@ export function parseConversationStatusOverrides(value: unknown): Record<string,
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).filter(([, override]) => {
       if (!override || typeof override !== "object" || Array.isArray(override)) return false;
-      const status = (override as Record<string, unknown>).status;
-      return status === "online" || status === "idle" || status === "dnd" || status === "offline";
+      const typedOverride = override as Record<string, unknown>;
+      const status = typedOverride.status;
+      const createdAt = typedOverride.createdAt;
+      return (
+        (status === "online" || status === "idle" || status === "dnd" || status === "offline") &&
+        typeof createdAt === "string" &&
+        createdAt.length > 0
+      );
     }),
   ) as Record<string, ConversationStatusOverride>;
 }
