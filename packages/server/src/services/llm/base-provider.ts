@@ -568,6 +568,13 @@ export abstract class BaseLLMProvider {
     return this.maxTokensOverride ?? null;
   }
 
+  /** Returns the configured context window for this provider connection, if known. */
+  public get maxContextValue(): number | null {
+    return typeof this.defaultMaxContext === "number" && Number.isFinite(this.defaultMaxContext)
+      ? this.defaultMaxContext
+      : null;
+  }
+
   protected fitMessagesToContext(messages: ChatMessage[], options: ContextFitOptions) {
     return fitMessagesToContext(messages, options, this.defaultMaxContext);
   }
@@ -657,12 +664,46 @@ export function parseEmbeddingResponse(json: unknown): number[][] {
     throw new Error("Embedding response did not include an embedding array.");
   }
 
-  return data.map((item) => {
+  const items = data.map((item) => {
     if (!isPlainRecord(item) || !Array.isArray(item.embedding)) {
       throw new Error("Embedding response contained an invalid embedding item.");
     }
-    return item.embedding as number[];
+    const rawIndex = item.index;
+    let index: number | null = null;
+    if (rawIndex !== undefined) {
+      if (!(typeof rawIndex === "number" && Number.isInteger(rawIndex) && rawIndex >= 0)) {
+        throw new Error("Embedding response contained an invalid embedding index.");
+      }
+      index = rawIndex;
+    }
+    return {
+      embedding: item.embedding as number[],
+      index,
+    };
   });
+
+  const indexedCount = items.filter((item) => item.index !== null).length;
+  if (indexedCount > 0 && indexedCount !== items.length) {
+    throw new Error("Embedding response mixed indexed and unindexed items.");
+  }
+
+  if (indexedCount === items.length) {
+    const ordered: number[][] = [];
+    for (const item of items) {
+      if (item.index! >= items.length || ordered[item.index!] !== undefined) {
+        throw new Error("Embedding response contained duplicate or out-of-range indexes.");
+      }
+      ordered[item.index!] = item.embedding;
+    }
+    for (let index = 0; index < items.length; index += 1) {
+      if (!ordered[index]) {
+        throw new Error("Embedding response indexes did not cover every input.");
+      }
+    }
+    return ordered;
+  }
+
+  return items.map((item) => item.embedding);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

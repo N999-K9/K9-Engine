@@ -123,21 +123,27 @@ export function buildLockedPersonaTrackerPatch({
   stats,
   status,
   inventory,
+  hasStats,
+  hasStatus,
+  hasInventory,
   snapshot,
   lockState,
 }: {
   stats: CharacterStat[];
   status: string;
   inventory: InventoryItem[];
+  hasStats?: boolean;
+  hasStatus?: boolean;
+  hasInventory?: boolean;
   snapshot: { personaStats?: unknown; playerStats?: unknown } | null | undefined;
   lockState: GameState | null | undefined;
 }) {
   const rawPatch: Record<string, unknown> = {};
-  if (stats.length > 0) rawPatch.personaStats = stats;
+  if (hasStats ?? stats.length > 0) rawPatch.personaStats = stats;
 
   const rawPlayerStatsPatch: Record<string, unknown> = {};
-  if (status) rawPlayerStatsPatch.status = status;
-  if (inventory.length > 0) rawPlayerStatsPatch.inventory = inventory;
+  if (hasStatus ?? !!status) rawPlayerStatsPatch.status = status;
+  if (hasInventory ?? inventory.length > 0) rawPlayerStatsPatch.inventory = inventory;
   if (Object.keys(rawPlayerStatsPatch).length > 0) rawPatch.playerStats = rawPlayerStatsPatch;
 
   const patch = applyTrackerFieldLocksToGameStatePatch(rawPatch, lockState);
@@ -538,8 +544,9 @@ export function appendGenerationTailMessages(
   const shouldAppendGoogleUserRegeneration =
     !options.impersonate && options.isGoogleProvider && !!options.regenerateUserMessage;
   const assistantPrefill = options.assistantPrefill.trim();
+  const shouldAppendAssistantPrefill = !options.impersonate && !!assistantPrefill;
 
-  if (assistantPrefill) {
+  if (shouldAppendAssistantPrefill) {
     // Strip the trailing edge: Anthropic's Messages API rejects a final assistant
     // message ending in whitespace (HTTP 400), which surfaces to users as a refusal.
     // A prefill ending in "\n" or a space is common. The user-facing prefill is
@@ -552,7 +559,7 @@ export function appendGenerationTailMessages(
   }
 
   return {
-    assistantPrefillInjected: !!assistantPrefill,
+    assistantPrefillInjected: shouldAppendAssistantPrefill,
     googleUserRegenerationInjected: shouldAppendGoogleUserRegeneration,
   };
 }
@@ -1014,11 +1021,18 @@ export function preserveTrackerCharacterUiFields(
 }
 
 /** Parse game state JSON fields from a DB row. */
+export function parseJsonField<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export function parseGameStateRow(row: Record<string, unknown>): GameState {
-  const manualOverrides =
-    row.manualOverrides && typeof row.manualOverrides === "string"
-      ? (JSON.parse(row.manualOverrides) as Record<string, string>)
-      : null;
+  const manualOverrides = parseJsonField<Record<string, string> | null>(row.manualOverrides, null);
   const fieldLocks = parseTrackerFieldLocks(row.fieldLocks);
   return {
     id: row.id as string,
@@ -1030,10 +1044,10 @@ export function parseGameStateRow(row: Record<string, unknown>): GameState {
     location: row.location as string | null,
     weather: row.weather as string | null,
     temperature: row.temperature as string | null,
-    presentCharacters: JSON.parse((row.presentCharacters as string) ?? "[]"),
-    recentEvents: JSON.parse((row.recentEvents as string) ?? "[]"),
-    playerStats: row.playerStats ? JSON.parse(row.playerStats as string) : null,
-    personaStats: row.personaStats ? JSON.parse(row.personaStats as string) : null,
+    presentCharacters: parseJsonField<any[]>(row.presentCharacters, []),
+    recentEvents: parseJsonField<string[]>(row.recentEvents, []),
+    playerStats: parseJsonField<PlayerStats | null>(row.playerStats, null),
+    personaStats: parseJsonField<any[] | null>(row.personaStats, null),
     manualOverrides,
     fieldLocks,
     createdAt: row.createdAt as string,

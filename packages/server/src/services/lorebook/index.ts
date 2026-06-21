@@ -702,7 +702,9 @@ export function resolveBudgetAndRecursivelyActivateLorebookEntriesWithDiagnostic
 ): { selected: ActivatedEntry[]; budgetSkippedEntries: LorebookBudgetSkippedEntry[] } {
   let state = createLorebookBudgetSelectionState();
   const processedIds = new Set<string>();
-  let frontier = scanForActivatedEntries(messages, entries, options);
+  const probabilityDecisions = options.probabilityDecisions ?? new Map<string, boolean>();
+  const scanOptions = { ...options, probabilityDecisions };
+  let frontier = scanForActivatedEntries(messages, entries, scanOptions);
   const budgetSkippedEntries: LorebookBudgetSkippedEntry[] = [];
 
   for (let depth = 0; frontier.length > 0; depth++) {
@@ -734,10 +736,15 @@ export function resolveBudgetAndRecursivelyActivateLorebookEntriesWithDiagnostic
     const recursiveContent = recursiveContentParts.join("\n");
     if (!recursiveContent) break;
 
-    const remaining = entries.filter((entry) => !processedIds.has(entry.id) && !state.selectedIds.has(entry.id));
+    const remaining = entries.filter(
+      (entry) => !processedIds.has(entry.id) && !state.selectedIds.has(entry.id) && !entry.excludeRecursion,
+    );
     if (remaining.length === 0) break;
 
-    frontier = scanForActivatedEntries([{ role: "system", content: recursiveContent }], remaining, options);
+    frontier = scanForActivatedEntries([{ role: "system", content: recursiveContent }], remaining, {
+      ...scanOptions,
+      recursionPass: true,
+    });
   }
 
   return {

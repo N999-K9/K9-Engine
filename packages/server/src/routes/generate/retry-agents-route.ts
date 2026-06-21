@@ -9,14 +9,17 @@ import {
   applyTrackerFieldLocksToGameStatePatch,
   getDefaultBuiltInAgentSettings,
   NARRATIVE_DIRECTOR_SECRET_PLOT_PROMPT,
+  customAgentHasCapability,
   isAgentAvailableInChatMode,
   isAgentConfigDeleted,
   normalizeAgentPromptTemplateSelectionMap,
   resolveAgentPromptTemplate,
   stripMacroComments,
+  findKnownModel,
   type AgentCallDebugEvent,
   type AgentContext,
   type AgentResult,
+  type APIProvider,
   type ChatMode,
   type GameMap,
   type WrapFormat,
@@ -57,6 +60,7 @@ import {
   buildLockedPersonaTrackerPatch,
   isMessageHiddenFromAI,
   parseExtra,
+  parseStoredGenerationParameters,
   parseGameStateRow,
   parseSnapshotPlayerStats,
   preserveTrackerCharacterUiFields,
@@ -81,6 +85,7 @@ import { filterGameInternalAgentIds } from "../../services/lorebook/game-loreboo
 import { sendSseEvent, startSseReply } from "./sse.js";
 import { buildGenerationPromptPresetCandidates } from "./prompt-preset-selection.js";
 import {
+  buildAgentConnectionUnavailableWarning,
   buildDefaultAgentConnectionWarning,
   buildLocalSidecarUnavailableWarning,
   isLocalSidecarConnectionId,
@@ -126,6 +131,50 @@ type ResolvedRetryAgent = {
 };
 
 const BUILT_IN_AGENT_TYPE_SET = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
+
+function findRetryResultAgent(result: AgentResult, agents: ResolvedRetryAgent[]): ResolvedAgent | null {
+  return (
+    agents.find((entry) => entry.resolved.id === result.agentId || entry.resolved.type === result.agentType)
+      ?.resolved ?? null
+  );
+}
+
+function customAgentCanApplyRetryResult(
+  result: AgentResult,
+  agents: ResolvedRetryAgent[],
+  capability: Parameters<typeof customAgentHasCapability>[1],
+): boolean {
+  if (BUILT_IN_AGENT_TYPE_SET.has(result.agentType)) return true;
+  const agent = findRetryResultAgent(result, agents);
+  return agent ? customAgentHasCapability(agent.settings, capability) : false;
+}
+
+function customAgentCanEmitRetryResult(result: AgentResult, agents: ResolvedRetryAgent[]): boolean {
+  if (BUILT_IN_AGENT_TYPE_SET.has(result.agentType)) return true;
+  switch (result.type) {
+    case "text_rewrite":
+      return customAgentCanApplyRetryResult(result, agents, "edit_messages");
+    case "lorebook_update":
+      return (
+        customAgentCanApplyRetryResult(result, agents, "edit_lorebooks") ||
+        customAgentCanApplyRetryResult(result, agents, "create_lorebooks")
+      );
+    case "game_state_update":
+    case "character_tracker_update":
+    case "persona_stats_update":
+    case "custom_tracker_update":
+    case "quest_update":
+      return customAgentCanApplyRetryResult(result, agents, "edit_trackers");
+    case "image_prompt":
+      return customAgentCanApplyRetryResult(result, agents, "trigger_image_generation");
+    case "prompt_patch":
+      return customAgentCanApplyRetryResult(result, agents, "edit_main_prompt");
+    case "frontend_theme_update":
+      return customAgentCanApplyRetryResult(result, agents, "change_frontend_styling");
+    default:
+      return true;
+  }
+}
 
 function applyDefaultBuiltInAgentTools(agentType: string, settings: unknown): Record<string, unknown> {
   const next =
@@ -515,10 +564,9 @@ async function buildRetryAgentContext(args: {
       characterId: typeof message.characterId === "string" && message.characterId ? message.characterId : null,
     })),
   );
-  const retryAssistantMsgIds = agentSlice
-    .filter((message: any) => message.role === "assistant")
-    .map((message: any) => message.id as string);
-  const retryCommittedSnapshots = await gameStateStore.getCommittedForMessages(retryAssistantMsgIds);
+  const retryCommittedSnapshots = await gameStateStore.getCommittedForMessages(
+    agentSlice.filter((message: any) => message.role === "assistant"),
+  );
   const retryVisibleAnchor =
     historicalGameStateAnchor ??
     (useLatestGameStateFallback && lastAssistant ? resolveVisibleGameStateAnchor([lastAssistant]) : null);
@@ -880,36 +928,125 @@ async function resolveRetryAgents(args: {
     conn.maxTokensOverride,
   );
   const chatConnectionMaxParallelJobs = Number(conn.maxParallelJobs) || 1;
+  const chatConnectionCustomParameters =
+    parseStoredGenerationParameters(conn.defaultParameters)?.customParameters ?? {};
+  const chatConnectionKnownModel = findKnownModel(conn.provider as APIProvider, conn.model.trim());
+  const chatConnectionMaxOutputTokens =
+    chatConnectionKnownModel?.maxOutput && chatConnectionKnownModel.maxOutput > 0
+      ? Math.floor(chatConnectionKnownModel.maxOutput)
+      : null;
   const resolvedAgents: ResolvedRetryAgent[] = [];
   const skippedLocalSidecarAgents: string[] = [];
   const defaultAgentConnectionAgents: string[] = [];
   const defaultAgentConn = await conns.getDefaultForAgents();
-  const defaultAgentConnection = defaultAgentConn
-    ? (() => {
-        const baseUrl = resolveBaseUrl(defaultAgentConn);
-        if (!baseUrl) return null;
-        return {
-          connectionId: defaultAgentConn.id as string,
-          provider: createLLMProvider(
-            defaultAgentConn.provider,
-            baseUrl,
-            defaultAgentConn.apiKey,
-            defaultAgentConn.maxContext,
-            defaultAgentConn.openrouterProvider,
-            defaultAgentConn.maxTokensOverride,
-          ),
-          model: defaultAgentConn.model,
-          maxParallelJobs: Number(defaultAgentConn.maxParallelJobs) || 1,
-        };
-      })()
-    : null;
   const localSidecarAvailableForTrackers =
     sidecarModelService.getConfig().useForTrackers && sidecarModelService.getConfiguredModelRef() !== null;
+  const unavailableConnectionWarnings = new Map<
+    string,
+    { reason: string; connectionName?: string; agentNames: string[] }
+  >();
+  const addUnavailableConnectionWarning = (
+    agentName: string,
+    resolution: { unavailableReason?: string; connectionName?: string },
+  ) => {
+    const reason = resolution.unavailableReason ?? "the connection is unavailable";
+    const key = `${resolution.connectionName ?? ""}:${reason}`;
+    const existing = unavailableConnectionWarnings.get(key);
+    if (existing) {
+      existing.agentNames.push(agentName);
+    } else {
+      unavailableConnectionWarnings.set(key, {
+        reason,
+        connectionName: resolution.connectionName,
+        agentNames: [agentName],
+      });
+    }
+  };
+  const resolveRetryAgentConnection = async (
+    connectionId: string | null,
+  ): Promise<{
+    entry: {
+      connectionId: string | null;
+      provider: any;
+      model: string;
+      customParameters: Record<string, unknown>;
+      maxOutputTokens: number | null;
+      maxParallelJobs: number;
+    } | null;
+    unavailableReason?: string;
+    connectionName?: string;
+  }> => {
+    if (!connectionId) {
+      return {
+        entry: {
+          connectionId: null,
+          provider,
+          model: conn.model,
+          customParameters: chatConnectionCustomParameters,
+          maxOutputTokens: chatConnectionMaxOutputTokens,
+          maxParallelJobs: chatConnectionMaxParallelJobs,
+        },
+      };
+    }
+
+    if (isLocalSidecarConnectionId(connectionId) && localSidecarAvailableForTrackers) {
+      return {
+        entry: {
+          connectionId,
+          provider: getLocalSidecarProvider(),
+          model: LOCAL_SIDECAR_MODEL,
+          customParameters: {},
+          maxOutputTokens: null,
+          maxParallelJobs: 1,
+        },
+      };
+    }
+
+    const agentConn = await conns.getWithKey(connectionId);
+    if (!agentConn) {
+      return { entry: null, unavailableReason: "the configured connection was deleted" };
+    }
+
+    const model = typeof agentConn.model === "string" ? agentConn.model.trim() : "";
+    if (!model) {
+      return { entry: null, unavailableReason: "no model is selected", connectionName: agentConn.name };
+    }
+
+    const agentBaseUrl = resolveBaseUrl(agentConn);
+    if (!agentBaseUrl) {
+      return {
+        entry: null,
+        unavailableReason: "the Base URL is empty or cannot be resolved",
+        connectionName: agentConn.name,
+      };
+    }
+
+    return {
+      entry: {
+        connectionId,
+        provider: createLLMProvider(
+          agentConn.provider,
+          agentBaseUrl,
+          agentConn.apiKey,
+          agentConn.maxContext,
+          agentConn.openrouterProvider,
+          agentConn.maxTokensOverride,
+        ),
+        model,
+        customParameters: parseStoredGenerationParameters(agentConn.defaultParameters)?.customParameters ?? {},
+        maxOutputTokens: (() => {
+          const knownModel = findKnownModel(agentConn.provider as APIProvider, model);
+          return knownModel?.maxOutput && knownModel.maxOutput > 0 ? Math.floor(knownModel.maxOutput) : null;
+        })(),
+        maxParallelJobs: Number(agentConn.maxParallelJobs) || 1,
+      },
+    };
+  };
+  const defaultAgentConnection = defaultAgentConn
+    ? await resolveRetryAgentConnection(defaultAgentConn.id as string)
+    : null;
 
   for (const cfg of enabledConfigs) {
-    let agentProvider = provider;
-    let agentModel = conn.model;
-    let agentMaxParallelJobs = chatConnectionMaxParallelJobs;
     const effectiveConnectionId = resolveAgentConnectionId({
       requestedConnectionId: cfg.connectionId as string | null,
       defaultAgentConnectionId: defaultAgentConn?.id ?? null,
@@ -925,34 +1062,20 @@ async function resolveRetryAgents(args: {
       continue;
     }
 
-    if (effectiveConnectionId) {
-      if (isLocalSidecarConnectionId(effectiveConnectionId) && localSidecarAvailableForTrackers) {
-        agentProvider = getLocalSidecarProvider();
-        agentModel = LOCAL_SIDECAR_MODEL;
-      } else if (defaultAgentConnection && effectiveConnectionId === defaultAgentConnection.connectionId) {
-        agentProvider = defaultAgentConnection.provider;
-        agentModel = defaultAgentConnection.model;
-        agentMaxParallelJobs = defaultAgentConnection.maxParallelJobs;
-        defaultAgentConnectionAgents.push(cfg.name ?? cfg.type);
-      } else {
-        const agentConn = await conns.getWithKey(effectiveConnectionId);
-        if (agentConn) {
-          const agentBaseUrl = resolveBaseUrl(agentConn);
-          if (agentBaseUrl) {
-            agentProvider = createLLMProvider(
-              agentConn.provider,
-              agentBaseUrl,
-              agentConn.apiKey,
-              agentConn.maxContext,
-              agentConn.openrouterProvider,
-              agentConn.maxTokensOverride,
-            );
-            agentModel = agentConn.model;
-            agentMaxParallelJobs = Number(agentConn.maxParallelJobs) || 1;
-          }
-        }
-      }
+    const agentConnection = await resolveRetryAgentConnection(effectiveConnectionId);
+    if (!agentConnection.entry) {
+      addUnavailableConnectionWarning(cfg.name ?? cfg.type, agentConnection);
+      logger.warn(
+        "[retry-agents] Skipping agent %s because its connection is unavailable: %s",
+        cfg.type,
+        agentConnection.unavailableReason ?? "unknown reason",
+      );
+      continue;
     }
+    if (defaultAgentConn && effectiveConnectionId === defaultAgentConn.id) {
+      defaultAgentConnectionAgents.push(cfg.name ?? cfg.type);
+    }
+
     const rawSettings = typeof cfg.settings === "string" ? JSON.parse(cfg.settings) : (cfg.settings ?? {});
     let settings = applyDefaultBuiltInAgentTools(cfg.type, rawSettings);
     if (cfg.type === "spotify") {
@@ -978,12 +1101,14 @@ async function resolveRetryAgents(args: {
         promptTemplate: selectedPromptTemplate,
         connectionId: effectiveConnectionId,
         settings,
-        provider: agentProvider,
-        model: agentModel,
-        maxParallelJobs: agentMaxParallelJobs,
+        customParameters: agentConnection.entry.customParameters,
+        maxOutputTokens: agentConnection.entry.maxOutputTokens,
+        provider: agentConnection.entry.provider,
+        model: agentConnection.entry.model,
+        maxParallelJobs: agentConnection.entry.maxParallelJobs,
       },
-      agentProvider,
-      agentModel,
+      agentProvider: agentConnection.entry.provider,
+      agentModel: agentConnection.entry.model,
     });
   }
 
@@ -991,15 +1116,17 @@ async function resolveRetryAgents(args: {
     skippedLocalSidecarAgents.length > 0 ? [buildLocalSidecarUnavailableWarning(skippedLocalSidecarAgents)] : [];
 
   for (const builtIn of builtInFallbackConfigs) {
-    const builtInProvider = defaultAgentConnection ?? {
-      provider,
-      model: conn.model,
-      connectionId: null,
-      maxParallelJobs: chatConnectionMaxParallelJobs,
-    };
-    if (defaultAgentConnection) {
-      defaultAgentConnectionAgents.push(builtIn.name);
+    const builtInConnection = defaultAgentConn ? defaultAgentConnection : await resolveRetryAgentConnection(null);
+    if (!builtInConnection?.entry) {
+      addUnavailableConnectionWarning(builtIn.name, builtInConnection ?? {});
+      logger.warn(
+        "[retry-agents] Skipping built-in agent %s because its connection is unavailable: %s",
+        builtIn.id,
+        builtInConnection?.unavailableReason ?? "unknown reason",
+      );
+      continue;
     }
+    if (defaultAgentConn) defaultAgentConnectionAgents.push(builtIn.name);
 
     let settings = applyDefaultBuiltInAgentTools(builtIn.id, getDefaultBuiltInAgentSettings(builtIn.id));
     if (builtIn.id === "spotify") {
@@ -1023,15 +1150,21 @@ async function resolveRetryAgents(args: {
         name: builtIn.name,
         phase: resolveRetryAgentRuntimePhase(builtIn.id, builtIn.phase),
         promptTemplate: selectedPromptTemplate,
-        connectionId: builtInProvider.connectionId,
+        connectionId: builtInConnection.entry.connectionId,
         settings,
-        provider: builtInProvider.provider,
-        model: builtInProvider.model,
-        maxParallelJobs: builtInProvider.maxParallelJobs,
+        customParameters: builtInConnection.entry.customParameters,
+        maxOutputTokens: builtInConnection.entry.maxOutputTokens,
+        provider: builtInConnection.entry.provider,
+        model: builtInConnection.entry.model,
+        maxParallelJobs: builtInConnection.entry.maxParallelJobs,
       },
-      agentProvider: builtInProvider.provider,
-      agentModel: builtInProvider.model,
+      agentProvider: builtInConnection.entry.provider,
+      agentModel: builtInConnection.entry.model,
     });
+  }
+
+  for (const warning of unavailableConnectionWarnings.values()) {
+    warnings.push(buildAgentConnectionUnavailableWarning(warning));
   }
 
   if (defaultAgentConn && defaultAgentConnectionAgents.length > 0) {
@@ -1039,7 +1172,7 @@ async function resolveRetryAgents(args: {
       buildDefaultAgentConnectionWarning({
         agentNames: defaultAgentConnectionAgents,
         connectionName: defaultAgentConn.name,
-        model: defaultAgentConn.model,
+        model: String(defaultAgentConn.model ?? "").trim(),
       }),
     );
   }
@@ -1360,6 +1493,7 @@ async function attachRetrySpotifyToolContexts(args: {
       (entry.resolved as any).__spotifyToolCalls = new Set<string>();
       (entry.resolved as any).__spotifyPlayApplied = false;
       (entry.resolved as any).__spotifyPlayError = null;
+      (entry.resolved as any).__spotifyToolError = spotifyError;
       (entry.resolved as any).__spotifyPlaybackPending = false;
     }
     entry.resolved.toolContext = {
@@ -1376,6 +1510,8 @@ async function attachRetrySpotifyToolContexts(args: {
           });
         }
         if (!spotifyAccessToken) {
+          (entry.resolved as any).__spotifyToolError =
+            spotifyError ?? "Spotify is not connected. Open the Music DJ agent and connect your account.";
           return JSON.stringify({
             error: spotifyError ?? "Spotify is not connected. Open the Music DJ agent and connect your account.",
           });
@@ -1511,6 +1647,12 @@ function buildSpotifyRetryQuery(result: AgentResult, context: AgentContext): { q
   };
 }
 
+function isBlockingSpotifyRetryToolError(error: string | null | undefined): error is string {
+  return (
+    !!error && /(not configured|not connected|token|scope|premium|active spotify device|playback failed)/i.test(error)
+  );
+}
+
 async function applyDeterministicSpotifyRetryFallback(args: {
   entry: ResolvedRetryAgent;
   result: AgentResult;
@@ -1612,6 +1754,10 @@ async function validateSpotifyRetryPlayback(
 ): Promise<AgentResult> {
   if (entry.resolved.type !== "spotify") return result;
   if (result.type !== "spotify_control") return result;
+  const spotifyToolError = (entry.resolved as any).__spotifyToolError;
+  if (isBlockingSpotifyRetryToolError(spotifyToolError)) {
+    return { ...result, success: false, error: spotifyToolError };
+  }
 
   const constraints =
     context.memory._spotifyDjConstraints && typeof context.memory._spotifyDjConstraints === "object"
@@ -2076,12 +2222,19 @@ async function applyRetryResultEffects(args: {
             },
           });
         }
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.warn(err, "[retry-agents] Failed to apply text rewrite");
       }
     }
 
-    if (result.success && result.type === "game_state_update" && result.data && typeof result.data === "object") {
+    if (
+      result.success &&
+      result.type === "game_state_update" &&
+      result.agentType !== "combat" &&
+      result.data &&
+      typeof result.data === "object" &&
+      customAgentCanApplyRetryResult(result, resolvedAgents, "edit_trackers")
+    ) {
       try {
         const gs = result.data as Record<string, unknown>;
         const worldStatePatch: Record<string, unknown> = {};
@@ -2117,8 +2270,8 @@ async function applyRetryResultEffects(args: {
         }
 
         sendSseEvent(reply, { type: "game_state_patch", data: lockedWorldStatePatch });
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.error(err, "[retry-agents] Failed to apply world-state tracker update");
       }
     }
 
@@ -2164,11 +2317,16 @@ async function applyRetryResultEffects(args: {
       result.success &&
       result.type === "character_tracker_update" &&
       result.data &&
-      typeof result.data === "object"
+      typeof result.data === "object" &&
+      customAgentCanApplyRetryResult(result, resolvedAgents, "edit_trackers")
     ) {
       try {
         const ctData = result.data as Record<string, unknown>;
-        let presentCharacters = (ctData.presentCharacters as any[]) ?? [];
+        if (!Array.isArray(ctData.presentCharacters) || ctData.presentCharacters.length === 0) {
+          logger.debug("[retry-agents] character-tracker emitted no presentCharacters; keeping existing snapshot");
+          continue;
+        }
+        let presentCharacters = ctData.presentCharacters as any[];
         const previousSnapshot = await loadRetryTargetGameStateSnapshot();
         let previousCharacters: any[] = [];
         if (previousSnapshot?.presentCharacters) {
@@ -2201,22 +2359,34 @@ async function applyRetryResultEffects(args: {
           { baseSnapshot: await loadRetryBaseGameStateSnapshot() },
         );
         sendSseEvent(reply, { type: "game_state_patch", data: { presentCharacters } });
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.error(err, "[retry-agents] Failed to apply character-tracker update");
       }
     }
 
-    if (result.success && result.type === "persona_stats_update" && result.data && typeof result.data === "object") {
+    if (
+      result.success &&
+      result.type === "persona_stats_update" &&
+      result.data &&
+      typeof result.data === "object" &&
+      customAgentCanApplyRetryResult(result, resolvedAgents, "edit_trackers")
+    ) {
       try {
         const psData = result.data as Record<string, unknown>;
-        const bars = (psData.stats as any[]) ?? [];
-        const status = (psData.status as string) ?? "";
-        const inventory = (psData.inventory as any[]) ?? [];
+        const hasStats = Array.isArray(psData.stats);
+        const hasStatus = typeof psData.status === "string";
+        const hasInventory = Array.isArray(psData.inventory);
+        const bars = hasStats ? (psData.stats as any[]) : [];
+        const status = hasStatus ? (psData.status as string) : "";
+        const inventory = hasInventory ? (psData.inventory as any[]) : [];
         const latest = await loadRetryTargetGameStateSnapshot();
         const personaPatch = buildLockedPersonaTrackerPatch({
           stats: bars,
           status,
           inventory,
+          hasStats,
+          hasStatus,
+          hasInventory,
           snapshot: latest,
           lockState: latest ? parseGameStateRow(latest as Record<string, unknown>) : null,
         });
@@ -2231,8 +2401,8 @@ async function applyRetryResultEffects(args: {
         if (personaPatch.changed) {
           sendSseEvent(reply, { type: "game_state_patch", data: personaPatch.patch });
         }
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.error(err, "[retry-agents] Failed to apply persona-stats tracker update");
       }
     }
 
@@ -2245,8 +2415,8 @@ async function applyRetryResultEffects(args: {
             await agentsStore.setMemory(agentConfigId, chatId, "overarchingArc", plotData.overarchingArc ?? null);
           }
         }
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.warn(err, "[retry-agents] Failed to persist secret plot memory");
       }
     }
 
@@ -2268,12 +2438,18 @@ async function applyRetryResultEffects(args: {
             updates: retryUpdates,
           });
         }
-      } catch {
-        // Non-critical patching failure.
+      } catch (err) {
+        logger.error(err, "[retry-agents] Failed to apply lorebook update");
       }
     }
 
-    if (result.success && result.type === "quest_update" && result.data && typeof result.data === "object") {
+    if (
+      result.success &&
+      result.type === "quest_update" &&
+      result.data &&
+      typeof result.data === "object" &&
+      customAgentCanApplyRetryResult(result, resolvedAgents, "edit_trackers")
+    ) {
       try {
         const qData = result.data as Record<string, unknown>;
         const updates = Array.isArray(qData.updates) ? qData.updates : [];
@@ -2286,7 +2462,9 @@ async function applyRetryResultEffects(args: {
         if (updates.length > 0) {
           const snap = await loadRetryTargetGameStateSnapshot();
           const existingPS = parseSnapshotPlayerStats(snap);
-          const questMerge = applyQuestUpdatesToPlayerStats(existingPS, updates);
+          const questMerge = applyQuestUpdatesToPlayerStats(existingPS, updates, {
+            autoRemoveFullyCompleted: true,
+          });
           const questTrackerPatch = buildLockedPlayerStatsArrayPatch<any>({
             field: "activeQuests",
             values: questMerge.quests,
@@ -2346,11 +2524,18 @@ async function applyRetryResultEffects(args: {
       }
     }
 
-    if (result.success && result.type === "custom_tracker_update" && result.data && typeof result.data === "object") {
+    if (
+      result.success &&
+      result.type === "custom_tracker_update" &&
+      result.data &&
+      typeof result.data === "object" &&
+      customAgentCanApplyRetryResult(result, resolvedAgents, "edit_trackers")
+    ) {
       try {
         const ctData = result.data as Record<string, unknown>;
-        const rawFields = (ctData.fields as any[]) ?? [];
-        if (rawFields.length > 0) {
+        const hasFields = Array.isArray(ctData.fields);
+        const rawFields = hasFields ? (ctData.fields as any[]) : [];
+        if (hasFields) {
           const snap = await loadRetryTargetGameStateSnapshot();
           const customTrackerPatch = buildLockedPlayerStatsArrayPatch<any>({
             field: "customTrackerFields",
@@ -2984,6 +3169,7 @@ export async function registerRetryAgentsRoute(app: FastifyInstance) {
       }
 
       for (const result of results) {
+        if (!customAgentCanEmitRetryResult(result, resolvedAgents)) continue;
         const cfg = resolvedAgents.find((entry) => entry.resolved.type === result.agentType)?.cfg;
         sendSseEvent(reply, {
           type: "agent_result",
@@ -3008,6 +3194,7 @@ export async function registerRetryAgentsRoute(app: FastifyInstance) {
       }
 
       for (const entry of lorebookKeeperRunEntries) {
+        if (!customAgentCanEmitRetryResult(entry.result, resolvedAgents)) continue;
         const cfg = lorebookKeeperAgent?.cfg;
         sendSseEvent(reply, {
           type: "agent_result",

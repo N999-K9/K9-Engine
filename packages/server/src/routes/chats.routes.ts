@@ -20,7 +20,6 @@ import {
   stripMacroComments,
   summariesPatchSchema,
   coerceGameStateTextValue,
-  formatCustomTrackerFieldForPrompt,
   normalizeTrackerFieldLocks,
   parseTrackerFieldLocks,
 } from "@marinara-engine/shared";
@@ -76,6 +75,7 @@ import {
 import { applyRegexScriptsToPromptMessages } from "../services/regex/regex-application.js";
 import { sanitizeGameNpcAvatarUrls } from "../services/game/npc-avatar-utils.js";
 import { applyImmersiveHtmlPromptInjection } from "../services/generation/immersive-html-injection.js";
+import { buildCommittedTrackerContextBlock } from "../services/generation/committed-tracker-context.js";
 import { parseLorebookWriteApprovalText } from "./generate/agent-write-approval.js";
 import { persistLorebookKeeperUpdates } from "./generate/lorebook-keeper-utils.js";
 
@@ -84,6 +84,16 @@ type EntryStateOverrides = Record<string, { ephemeral?: number | null; enabled?:
 const MEMORY_RECALL_IMPORT_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
 const MEMORY_RECALL_IMPORT_BATCH_SIZE = 500;
 const PROFESSOR_MARI_INTERNAL_CHAT_MARKER = "professor-mari";
+
+function parseSnapshotJson<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 function toSafeExportName(name: string, fallback: string) {
   const safe = name
@@ -227,123 +237,16 @@ function formatPeekTrackerContextBlock(args: {
   wrapFormat: TrackerWrapFormat;
   snap: typeof gameStateSnapshots.$inferSelect;
   chatMeta: Record<string, unknown>;
+  chatEnableAgents: boolean;
   activeAgentIds: string[];
 }): string | null {
-  const { wrapFormat, snap, chatMeta, activeAgentIds } = args;
-  const active = new Set(activeAgentIds);
-  const hasWorldState = active.has("world-state");
-  const hasCharTracker = active.has("character-tracker");
-  const hasPersonaStats = active.has("persona-stats");
-  const hasQuest = active.has("quest");
-  const hasCustomTracker = active.has("custom-tracker");
-
-  if (!hasWorldState && !hasCharTracker && !hasPersonaStats && !hasQuest && !hasCustomTracker) return null;
-
-  const trackerParts: string[] = [];
-
-  if (hasWorldState) {
-    const wsParts: string[] = [];
-    if (snap.date) wsParts.push(`Date: ${snap.date}`);
-    if (snap.time) wsParts.push(`Time: ${snap.time}`);
-    if (snap.location) wsParts.push(`Location: ${snap.location}`);
-    if (snap.weather) wsParts.push(`Weather: ${snap.weather}`);
-    if (snap.temperature) wsParts.push(`Temperature: ${snap.temperature}`);
-    if (wsParts.length > 0) trackerParts.push(wrapContent(wsParts.join("\n"), "World", wrapFormat));
-  }
-
-  if (hasCharTracker) {
-    try {
-      const presentChars = JSON.parse(snap.presentCharacters);
-      if (Array.isArray(presentChars) && presentChars.length > 0) {
-        const charLines = presentChars.map((c: any) => {
-          if (typeof c === "string") return `- ${c}`;
-          const details: string[] = [];
-          if (c.mood) details.push(`mood: ${c.mood}`);
-          if (c.appearance) details.push(`appearance: ${c.appearance}`);
-          if (c.outfit) details.push(`outfit: ${c.outfit}`);
-          if (c.thoughts) details.push(`thoughts: ${c.thoughts}`);
-          if (Array.isArray(c.stats) && c.stats.length > 0) {
-            const statStr = c.stats.map((s: any) => `${s.name}: ${s.value}${s.max ? `/${s.max}` : ""}`).join(", ");
-            details.push(`stats: ${statStr}`);
-          }
-          const detailStr = details.length > 0 ? ` (${details.join("; ")})` : "";
-          return `- ${c.emoji ?? ""} ${c.name ?? c}${detailStr}`;
-        });
-        trackerParts.push(wrapContent(charLines.join("\n"), "Present Characters", wrapFormat));
-      }
-    } catch {
-      /* ignore malformed tracker data */
-    }
-  }
-
-  if (hasPersonaStats && snap.personaStats) {
-    try {
-      const psBars = typeof snap.personaStats === "string" ? JSON.parse(snap.personaStats) : snap.personaStats;
-      if (Array.isArray(psBars) && psBars.length > 0) {
-        const barLines = psBars.map((b: any) => `- ${b.name}: ${b.value}/${b.max}`);
-        trackerParts.push(wrapContent(barLines.join("\n"), "Persona Stats", wrapFormat));
-      }
-    } catch {
-      /* ignore malformed tracker data */
-    }
-  }
-
-  if (snap.playerStats) {
-    try {
-      const stats = typeof snap.playerStats === "string" ? JSON.parse(snap.playerStats) : snap.playerStats;
-
-      if (hasPersonaStats && stats?.status)
-        trackerParts.push(wrapContent(`Status: ${stats.status}`, "Status", wrapFormat));
-
-      if (hasQuest && Array.isArray(stats?.activeQuests) && stats.activeQuests.length > 0) {
-        const questLines = stats.activeQuests.map((q: any) => {
-          const objectives = Array.isArray(q.objectives)
-            ? q.objectives.map((o: any) => `  ${o.completed ? "[x]" : "[ ]"} ${o.text}`).join("\n")
-            : "";
-          return `- ${q.name}${q.completed ? " (completed)" : ""}${objectives ? "\n" + objectives : ""}`;
-        });
-        trackerParts.push(wrapContent(questLines.join("\n"), "Active Quests", wrapFormat));
-      }
-
-      if (hasPersonaStats && Array.isArray(stats?.inventory) && stats.inventory.length > 0) {
-        const invLines = stats.inventory.map(
-          (item: any) =>
-            `- ${item.name}${item.quantity > 1 ? ` x${item.quantity}` : ""}${item.description ? ` — ${item.description}` : ""}`,
-        );
-        trackerParts.push(wrapContent(invLines.join("\n"), "Inventory", wrapFormat));
-      }
-
-      if (hasPersonaStats && Array.isArray(stats?.stats) && stats.stats.length > 0) {
-        const statLines = stats.stats.map((s: any) => `- ${s.name}: ${s.value}${s.max ? `/${s.max}` : ""}`);
-        trackerParts.push(wrapContent(statLines.join("\n"), "Stats", wrapFormat));
-      }
-
-      if (hasCustomTracker && Array.isArray(stats?.customTrackerFields) && stats.customTrackerFields.length > 0) {
-        const customLines = stats.customTrackerFields.map(formatCustomTrackerFieldForPrompt);
-        trackerParts.push(wrapContent(customLines.join("\n"), "Custom Tracker", wrapFormat));
-      }
-    } catch {
-      /* ignore malformed tracker data */
-    }
-  }
-
-  const playerNotes = typeof chatMeta.gamePlayerNotes === "string" ? chatMeta.gamePlayerNotes.trim() : "";
-  if (playerNotes) {
-    trackerParts.push(
-      wrapContent(
-        `The player has written these personal notes. Consider them when narrating — they reflect what the player is tracking, their theories, and plans:\n${playerNotes}`,
-        "Player Notes",
-        wrapFormat,
-      ),
-    );
-  }
-
-  if (trackerParts.length <= 0) return null;
-  if (wrapFormat === "none") return trackerParts.join("\n\n");
-  if (wrapFormat === "xml") {
-    return `<context>\n${trackerParts.map((part) => "    " + part.replace(/\n/g, "\n    ")).join("\n")}\n</context>`;
-  }
-  return `# Context\n*(Established state as of the last message. Do not re-describe — advance from here.)*\n${trackerParts.join("\n")}`;
+  return buildCommittedTrackerContextBlock({
+    chatEnableAgents: args.chatEnableAgents,
+    activeAgentIds: args.activeAgentIds,
+    latestGameState: args.snap,
+    chatMetadata: args.chatMeta,
+    wrapFormat: args.wrapFormat,
+  });
 }
 
 function resolveLorebookGenerationTriggers(mode: unknown): string[] {
@@ -569,6 +472,14 @@ export async function chatsRoutes(app: FastifyInstance) {
       data.promptPresetId = null;
     }
     return storage.update(req.params.id, data);
+  });
+
+  app.post<{ Params: { id: string } }>("/:id/touch", async (req, reply) => {
+    const chat = await storage.getById(req.params.id);
+    if (!chat || (hasProfessorMariCharacter(chat) && !isHomeProfessorMariChat(chat))) {
+      return reply.status(404).send({ error: "Chat not found" });
+    }
+    return storage.touch(req.params.id);
   });
 
   // Update chat metadata (partial merge)
@@ -1496,7 +1407,8 @@ export async function chatsRoutes(app: FastifyInstance) {
     let updated: Awaited<ReturnType<typeof gameStateStore.updateLatest>> = null;
     if (hasExplicitTarget) {
       const targetMessage = await storage.getMessage(targetMessageId);
-      if (targetMessage?.chatId === req.params.id) {
+      const targetSnapshot = await gameStateStore.getByMessage(targetMessageId, targetSwipeIndex);
+      if (targetMessage?.chatId === req.params.id || targetSnapshot?.chatId === req.params.id) {
         updated = await gameStateStore.updateByMessage(
           targetMessageId,
           targetSwipeIndex,
@@ -1943,7 +1855,6 @@ export async function chatsRoutes(app: FastifyInstance) {
                   appearance: cardPromptText(charData.extensions?.appearance),
                   example: cardPromptText(charData.mes_example),
                   systemPrompt: cardPromptText(charData.system_prompt),
-                  postHistoryInstructions: cardPromptText(charData.post_history_instructions),
                 },
               };
               const resolveCharacterMacros = (value: string) => resolveMacros(value, characterMacroContext);
@@ -1999,15 +1910,6 @@ export async function chatsRoutes(app: FastifyInstance) {
                   wrapContent(
                     resolveCharacterMacros(characterMacroContext.characterFields.example),
                     "example_dialogue",
-                    wrapFormat,
-                    2,
-                  ),
-                );
-              if (characterMacroContext.characterFields.postHistoryInstructions)
-                parts.push(
-                  wrapContent(
-                    resolveCharacterMacros(characterMacroContext.characterFields.postHistoryInstructions),
-                    "post_history_instructions",
                     wrapFormat,
                     2,
                   ),
@@ -2077,7 +1979,7 @@ export async function chatsRoutes(app: FastifyInstance) {
           if (chatEnableAgents && activeAgentIds.length > 0) {
             const snap = await loadLatestChatGameSnapshot(app, req.params.id, visibleGameStateAnchor);
             const contextBlock = snap
-              ? formatPeekTrackerContextBlock({ wrapFormat, snap, chatMeta, activeAgentIds })
+              ? formatPeekTrackerContextBlock({ wrapFormat, snap, chatMeta, chatEnableAgents, activeAgentIds })
               : null;
 
             if (contextBlock) {
@@ -2269,18 +2171,54 @@ export async function chatsRoutes(app: FastifyInstance) {
         user_name: "User",
         character_name: primaryCharName,
         create_date: chat.createdAt,
-        chat_metadata: {},
+        chat_metadata: {
+          ...metadata,
+          branchName,
+          marinara_metadata: metadata,
+        },
       }),
     ];
 
     for (const msg of msgs) {
+      const messageExtra = parseExportMetadata(msg.extra);
+      const swipes = await storage.getSwipes(msg.id);
+      const exportSwipes =
+        swipes.length > 0
+          ? swipes.map((swipe: { index: number; content: string; extra?: unknown; createdAt?: string }) => ({
+              index: swipe.index,
+              content: swipe.index === msg.activeSwipeIndex ? msg.content : swipe.content,
+              extra: swipe.index === msg.activeSwipeIndex ? messageExtra : parseExportMetadata(swipe.extra),
+              createdAt: swipe.createdAt,
+            }))
+          : [
+              {
+                index: 0,
+                content: msg.content,
+                extra: messageExtra,
+                createdAt: msg.createdAt,
+              },
+            ];
       lines.push(
         JSON.stringify({
           name: getDisplayName(msg),
           is_user: msg.role === "user",
-          is_system: msg.role === "system" || msg.role === "narrator",
+          is_system: msg.role === "system",
+          role: msg.role,
+          character_id: msg.characterId,
           mes: msg.content,
+          swipes: exportSwipes.map((swipe) => swipe.content),
+          swipe_id: msg.activeSwipeIndex,
           send_date: msg.createdAt,
+          extra: {
+            ...messageExtra,
+            marinara_role: msg.role,
+            marinara_character_id: msg.characterId,
+            marinara_swipes: exportSwipes.map((swipe) => ({
+              index: swipe.index,
+              extra: swipe.extra,
+              created_at: swipe.createdAt,
+            })),
+          },
         }),
       );
     }
@@ -2526,10 +2464,7 @@ export async function chatsRoutes(app: FastifyInstance) {
         targetSwipeIndex: number,
       ) => {
         try {
-          const overrides =
-            snapshot.manualOverrides && typeof snapshot.manualOverrides === "string"
-              ? (JSON.parse(snapshot.manualOverrides) as Record<string, string>)
-              : null;
+          const overrides = parseSnapshotJson<Record<string, string> | null>(snapshot.manualOverrides, null);
           await gameStateStore.create(
             {
               chatId: newChat.id,
@@ -2540,32 +2475,17 @@ export async function chatsRoutes(app: FastifyInstance) {
               location: (snapshot.location as string) ?? null,
               weather: (snapshot.weather as string) ?? null,
               temperature: (snapshot.temperature as string) ?? null,
-              presentCharacters:
-                typeof snapshot.presentCharacters === "string"
-                  ? JSON.parse(snapshot.presentCharacters)
-                  : (snapshot.presentCharacters ?? []),
-              recentEvents:
-                typeof snapshot.recentEvents === "string"
-                  ? JSON.parse(snapshot.recentEvents)
-                  : (snapshot.recentEvents ?? []),
-              playerStats:
-                snapshot.playerStats == null
-                  ? null
-                  : typeof snapshot.playerStats === "string"
-                    ? JSON.parse(snapshot.playerStats)
-                    : snapshot.playerStats,
-              personaStats:
-                snapshot.personaStats == null
-                  ? null
-                  : typeof snapshot.personaStats === "string"
-                    ? JSON.parse(snapshot.personaStats)
-                    : snapshot.personaStats,
+              presentCharacters: parseSnapshotJson(snapshot.presentCharacters, []),
+              recentEvents: parseSnapshotJson(snapshot.recentEvents, []),
+              playerStats: parseSnapshotJson(snapshot.playerStats, null),
+              personaStats: parseSnapshotJson(snapshot.personaStats, null),
               fieldLocks: parseTrackerFieldLocks(snapshot.fieldLocks),
               committed: (snapshot.committed as any) === 1,
             } as any,
             overrides,
           );
-        } catch {
+        } catch (err) {
+          logger.warn(err, "Failed to copy game-state snapshot while branching chat");
           // Ignore individual snapshot copy failures; branching should still succeed.
         }
       };

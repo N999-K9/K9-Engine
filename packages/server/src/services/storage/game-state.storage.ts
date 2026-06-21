@@ -8,6 +8,7 @@ import { newId, now } from "../../utils/id-generator.js";
 import {
   coerceGameStateTextValue,
   normalizeTrackerFieldLocks,
+  normalizeTrackerFieldLocksForState,
   parseTrackerFieldLocks,
   trackerFieldLocksAreEmpty,
   type GameState,
@@ -32,6 +33,24 @@ type GameStateUpdateFields = Partial<
     | "fieldLocks"
   >
 >;
+
+type LockMigrationStateSource = {
+  id?: unknown;
+  chatId?: unknown;
+  messageId?: unknown;
+  swipeIndex?: unknown;
+  date?: unknown;
+  time?: unknown;
+  location?: unknown;
+  weather?: unknown;
+  temperature?: unknown;
+  presentCharacters?: unknown;
+  recentEvents?: unknown;
+  playerStats?: unknown;
+  personaStats?: unknown;
+  fieldLocks?: unknown;
+  createdAt?: unknown;
+};
 
 function coerceSnapshotTextFields(fields: Partial<Pick<GameState, (typeof MANUAL_OVERRIDE_FIELDS)[number]>>) {
   return {
@@ -67,6 +86,37 @@ function serializeFieldLocks(fieldLocks: TrackerFieldLocks | null | undefined) {
   return trackerFieldLocksAreEmpty(normalized) ? null : JSON.stringify(normalized);
 }
 
+function parseSnapshotJson<T>(value: unknown, fallback: T): T {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return value == null ? fallback : (value as T);
+}
+
+function buildLockMigrationState(row: LockMigrationStateSource): GameState {
+  return {
+    id: typeof row.id === "string" ? row.id : "",
+    chatId: typeof row.chatId === "string" ? row.chatId : "",
+    messageId: typeof row.messageId === "string" ? row.messageId : "",
+    swipeIndex: typeof row.swipeIndex === "number" ? row.swipeIndex : 0,
+    date: coerceGameStateTextValue(row.date),
+    time: coerceGameStateTextValue(row.time),
+    location: coerceGameStateTextValue(row.location),
+    weather: coerceGameStateTextValue(row.weather),
+    temperature: coerceGameStateTextValue(row.temperature),
+    presentCharacters: parseSnapshotJson(row.presentCharacters, []),
+    recentEvents: parseSnapshotJson(row.recentEvents, []),
+    playerStats: parseSnapshotJson(row.playerStats, null),
+    personaStats: parseSnapshotJson(row.personaStats, null),
+    fieldLocks: parseTrackerFieldLocks(row.fieldLocks),
+    createdAt: typeof row.createdAt === "string" ? row.createdAt : now(),
+  };
+}
+
 export function createGameStateStorage(db: DB) {
   return {
     async getLatest(chatId: string) {
@@ -76,6 +126,11 @@ export function createGameStateStorage(db: DB) {
         .where(eq(gameStateSnapshots.chatId, chatId))
         .orderBy(desc(gameStateSnapshots.createdAt))
         .limit(1);
+      return rows[0] ?? null;
+    },
+
+    async getById(id: string) {
+      const rows = await db.select().from(gameStateSnapshots).where(eq(gameStateSnapshots.id, id)).limit(1);
       return rows[0] ?? null;
     },
 
@@ -214,15 +269,26 @@ export function createGameStateStorage(db: DB) {
     },
 
     /** Batch-fetch committed snapshots for multiple messages. Returns a Map of messageId → row. */
-    async getCommittedForMessages(messageIds: string[]) {
+    async getCommittedForMessages(messagesOrIds: Array<string | { id: string; activeSwipeIndex?: number | null }>) {
+      const activeSwipeByMessageId = new Map<string, number>();
+      const messageIds = messagesOrIds.map((messageOrId) => {
+        if (typeof messageOrId === "string") return messageOrId;
+        if (typeof messageOrId.activeSwipeIndex === "number") {
+          activeSwipeByMessageId.set(messageOrId.id, messageOrId.activeSwipeIndex);
+        }
+        return messageOrId.id;
+      });
       if (messageIds.length === 0) return new Map<string, typeof gameStateSnapshots.$inferSelect>();
       const rows = await db
         .select()
         .from(gameStateSnapshots)
-        .where(and(inArray(gameStateSnapshots.messageId, messageIds), eq(gameStateSnapshots.committed, 1)));
+        .where(and(inArray(gameStateSnapshots.messageId, messageIds), eq(gameStateSnapshots.committed, 1)))
+        .orderBy(desc(gameStateSnapshots.createdAt));
       const map = new Map<string, typeof gameStateSnapshots.$inferSelect>();
       for (const row of rows) {
-        map.set(row.messageId, row);
+        const activeSwipeIndex = activeSwipeByMessageId.get(row.messageId);
+        if (activeSwipeIndex !== undefined && row.swipeIndex !== activeSwipeIndex) continue;
+        if (!map.has(row.messageId)) map.set(row.messageId, row);
       }
       return map;
     },
@@ -336,6 +402,10 @@ export function createGameStateStorage(db: DB) {
           : null,
         fieldLocks: parseTrackerFieldLocks(latest?.fieldLocks),
       };
+      baseState.fieldLocks = normalizeTrackerFieldLocksForState(
+        baseState.fieldLocks,
+        buildLockMigrationState(baseState),
+      );
 
       // Apply the incoming fields on top of the cloned base
       if (fields.date !== undefined) baseState.date = coerceGameStateTextValue(fields.date);
@@ -346,7 +416,9 @@ export function createGameStateStorage(db: DB) {
       if (fields.presentCharacters !== undefined) baseState.presentCharacters = fields.presentCharacters as any;
       if (fields.playerStats !== undefined) baseState.playerStats = fields.playerStats as any;
       if (fields.personaStats !== undefined) baseState.personaStats = fields.personaStats as any;
-      if (fields.fieldLocks !== undefined) baseState.fieldLocks = normalizeTrackerFieldLocks(fields.fieldLocks);
+      if (fields.fieldLocks !== undefined) {
+        baseState.fieldLocks = normalizeTrackerFieldLocksForState(fields.fieldLocks, buildLockMigrationState(baseState));
+      }
 
       const manualOverrides = manual
         ? MANUAL_OVERRIDE_FIELDS.reduce<Record<string, string>>((acc, key) => {
@@ -368,6 +440,7 @@ export function createGameStateStorage(db: DB) {
       manual?: boolean,
     ) {
       const updates: Record<string, unknown> = {};
+      const existingLockMigrationState = buildLockMigrationState(row);
       if (fields.date !== undefined) updates.date = coerceGameStateTextValue(fields.date);
       if (fields.time !== undefined) updates.time = coerceGameStateTextValue(fields.time);
       if (fields.location !== undefined) updates.location = coerceGameStateTextValue(fields.location);
@@ -398,7 +471,19 @@ export function createGameStateStorage(db: DB) {
       }
 
       if (fields.fieldLocks !== undefined) {
-        updates.fieldLocks = serializeFieldLocks(fields.fieldLocks);
+        const incomingLockMigrationState = buildLockMigrationState({
+          ...row,
+          ...(fields.presentCharacters !== undefined ? { presentCharacters: fields.presentCharacters } : {}),
+          ...(fields.playerStats !== undefined ? { playerStats: fields.playerStats } : {}),
+          ...(fields.personaStats !== undefined ? { personaStats: fields.personaStats } : {}),
+        });
+        updates.fieldLocks = serializeFieldLocks(
+          normalizeTrackerFieldLocksForState(fields.fieldLocks, incomingLockMigrationState),
+        );
+      } else if (row.fieldLocks) {
+        updates.fieldLocks = serializeFieldLocks(
+          normalizeTrackerFieldLocksForState(parseTrackerFieldLocks(row.fieldLocks), existingLockMigrationState),
+        );
       }
 
       if (Object.keys(updates).length === 0) return row;

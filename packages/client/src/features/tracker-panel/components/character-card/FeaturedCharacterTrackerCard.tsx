@@ -5,6 +5,7 @@ import {
   characterStatTrackerLockKey,
   characterTrackerLockKey,
   isTrackerFieldLocked,
+  renameTrackerFieldLockPrefix,
   type PresentCharacter,
 } from "@marinara-engine/shared";
 import type {
@@ -108,13 +109,13 @@ export function FeaturedCharacterTrackerCard({
   onToggleFeatured?: () => void;
   onUploadAvatar?: () => void;
 }) {
-  const { fieldLocks, lockMode, onToggleFieldLock } = useTrackerLockContext();
+  const { fieldLocks, lockMode, onToggleFieldLock, onUpdateFieldLocks } = useTrackerLockContext();
   const thoughtAnchorRef = useRef<HTMLDivElement | null>(null);
   const thoughtBubbleRef = useRef<HTMLDivElement | null>(null);
   const thoughtControlRef = useRef<HTMLButtonElement | null>(null);
   const [thoughtsOpen, setThoughtsOpen] = useState(false);
   const customFields = Object.entries(character.customFields ?? {});
-  const characterStats = character.stats ?? [];
+  const characterStats = Array.isArray(character.stats) ? character.stats : [];
   const hasEditableStatAdd = !!onUpdate && addMode;
   const featuredStatColumnHeightRem =
     trackerPanelSizeProfile === "expanded"
@@ -198,6 +199,15 @@ export function FeaturedCharacterTrackerCard({
     const trimmedName = nextName.trim();
     if (trimmedName && trimmedName !== oldName && Object.prototype.hasOwnProperty.call(nextFields, trimmedName)) {
       return;
+    }
+    if (trimmedName && trimmedName !== oldName) {
+      onUpdateFieldLocks?.((locks) =>
+        renameTrackerFieldLockPrefix(
+          locks,
+          characterCustomFieldTrackerLockKey(character, characterIndex, oldName, "name").replace(/\.name$/, ""),
+          characterCustomFieldTrackerLockKey(character, characterIndex, trimmedName, "name").replace(/\.name$/, ""),
+        ),
+      );
     }
     delete nextFields[oldName];
     if (trimmedName) nextFields[trimmedName] = nextValue;
@@ -318,7 +328,9 @@ export function FeaturedCharacterTrackerCard({
             scrollable={characterStatsOverflowPortrait}
             wideColumns={useFeaturedStatColumns}
             className={FEATURED_STAT_BAND_CLASS}
-            getLockKey={(statIndex, field) => characterStatTrackerLockKey(character, characterIndex, statIndex, field)}
+            getLockKey={(statIndex, field, stat) =>
+              characterStatTrackerLockKey(character, characterIndex, stat, field, statIndex)
+            }
           />
         )}
       </div>

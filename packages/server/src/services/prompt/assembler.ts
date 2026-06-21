@@ -5,6 +5,7 @@
 // persona, and per-chat choice selections.
 // ──────────────────────────────────────────────
 import type { DB } from "../../db/connection.js";
+import { logger } from "../../lib/logger.js";
 import type {
   ChatMLMessage,
   PromptPreset,
@@ -26,6 +27,7 @@ import type { LorebookScanResult } from "../lorebook/index.js";
 import {
   buildPromptMacroContext,
   collectCharacterDepthPromptEntries,
+  collectCharacterPostHistoryEntries,
   resolveMacrosWithVariableSnapshot,
 } from "./macro-context.js";
 
@@ -334,18 +336,24 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       }
     }
 
-    const resolved = await resolveSection(section, {
-      macroCtx,
-      markerCtx,
-      macroOptions: deferAllMacroOptions,
-      wrapFormat,
-      runtimeAgentData: input.runtimeAgentData ?? {},
-      runtimeAgentTypesUsed,
-    });
+    let resolved: ResolvedSection | null;
+    try {
+      resolved = await resolveSection(section, {
+        macroCtx,
+        markerCtx,
+        macroOptions: deferAllMacroOptions,
+        wrapFormat,
+        runtimeAgentData: input.runtimeAgentData ?? {},
+        runtimeAgentTypesUsed,
+      });
+    } catch (err) {
+      logger.warn(err, "[prompt] Skipping section %s after marker expansion failed", section.id);
+      continue;
+    }
 
     if (!resolved) continue;
 
-    if (section.injectionPosition === "depth" && section.injectionDepth > 0) {
+    if (section.injectionPosition === "depth" && section.injectionDepth >= 0) {
       depthSections.push(resolved);
     } else {
       orderedSections.push(resolved);
@@ -451,6 +459,16 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   const characterDepthEntries = await collectCharacterDepthPromptEntries(input.db, input.characterIds, macroCtx);
   if (characterDepthEntries.length > 0) {
     allDepthEntries.push(characterDepthEntries);
+  }
+
+  const characterPostHistoryEntries = await collectCharacterPostHistoryEntries(
+    input.db,
+    input.characterIds,
+    macroCtx,
+    wrapFormat,
+  );
+  if (characterPostHistoryEntries.length > 0) {
+    allDepthEntries.push(characterPostHistoryEntries);
   }
 
   const combinedDepthEntries = allDepthEntries.flat();
@@ -750,12 +768,9 @@ function enforceStrictRoles(messages: ChatMLMessage[]): ChatMLMessage[] {
     const msg = messages[idx]!;
 
     if (msg.role === "system") {
-      const leadingSystem = result[0];
-      if (leadingSystem?.role === "system") {
-        mergeInto(leadingSystem, msg);
-      } else {
-        result.unshift({ ...msg });
-      }
+      const prev = result[result.length - 1];
+      if (prev?.role === "system") mergeInto(prev, msg);
+      else result.push({ ...msg });
       continue;
     }
 

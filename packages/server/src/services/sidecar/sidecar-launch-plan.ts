@@ -5,6 +5,10 @@ export type LlamaStartupPlan = {
 
 const LLAMA_SERVER_PARALLEL_SLOTS = 2;
 
+function needsCudaSingleGpuSplitMode(modelPath: string): boolean {
+  return /gemma/i.test(modelPath);
+}
+
 export function buildLlamaArgs(options: {
   modelPath: string;
   gpuLayers: number;
@@ -33,9 +37,11 @@ export function buildLlamaArgs(options: {
     args.push("--jinja");
   }
 
+  args.push("--embeddings", "--pooling", "mean");
+
   // Gemma 4 needs split mode disabled on CUDA multi-GPU launches,
   // but non-CUDA builds may reject the flag entirely.
-  if (/cuda/i.test(options.runtimeVariant) && options.gpuLayers > 0) {
+  if (/cuda/i.test(options.runtimeVariant) && options.gpuLayers > 0 && needsCudaSingleGpuSplitMode(options.modelPath)) {
     args.push("-sm", "none");
   }
 

@@ -9,12 +9,19 @@ import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
 import { createRegexScriptsStorage } from "../storage/regex-scripts.storage.js";
 import { importSTLorebook } from "./st-lorebook.importer.js";
 import { isPatternSafe } from "@marinara-engine/shared";
-import type { CharacterData, CreateRegexScriptInput, RegexPlacement } from "@marinara-engine/shared";
+import type {
+  CharacterBookEntryPosition,
+  CharacterBookEntryRole,
+  CharacterData,
+  CreateRegexScriptInput,
+  RegexPlacement,
+} from "@marinara-engine/shared";
 import { existsSync, mkdirSync } from "fs";
 import { unlink, writeFile } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { DATA_DIR } from "../../utils/data-dir.js";
+import { isAllowedImageBuffer } from "../../utils/security.js";
 import AdmZip from "adm-zip";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "./import-timestamps.js";
 
@@ -93,15 +100,16 @@ export interface STCharacterImportOptions {
 }
 
 // SillyTavern regex placement ids → our placement strings (1 = user input, 2 = AI output).
-function convertStPlacements(placement: unknown): RegexPlacement[] {
+// Unknown-only placement arrays are skipped by the importer instead of being
+// silently remapped to AI output.
+function convertStPlacements(placement: unknown): RegexPlacement[] | null {
+  if (!Array.isArray(placement)) return ["ai_output"];
   const out: RegexPlacement[] = [];
-  if (Array.isArray(placement)) {
-    for (const n of placement) {
-      if (n === 1 && !out.includes("user_input")) out.push("user_input");
-      else if (n === 2 && !out.includes("ai_output")) out.push("ai_output");
-    }
+  for (const n of placement) {
+    if (n === 1 && !out.includes("user_input")) out.push("user_input");
+    else if (n === 2 && !out.includes("ai_output")) out.push("ai_output");
   }
-  return out;
+  return out.length > 0 ? out : null;
 }
 
 /**
@@ -126,26 +134,23 @@ function convertStRegexScripts(
     const delimited = /^\/(.*)\/([a-z]*)$/is.exec(rawFind);
     const source = delimited ? delimited[1]! : rawFind;
     if (!source || !isPatternSafe(source)) continue;
-    let flags = Array.from(new Set((delimited?.[2] || "gi").replace(/[^gimsuy]/g, ""))).join("");
-    if (!flags.includes("g")) flags += "g";
+    const flags = Array.from(new Set((delimited?.[2] ?? "").replace(/[^gimsuy]/g, ""))).join("");
     try {
       new RegExp(source, flags);
     } catch {
       continue;
     }
     const placement = convertStPlacements(s.placement);
-    const resolvedPlacement: RegexPlacement[] = placement.length > 0 ? placement : ["ai_output"];
+    if (!placement) continue;
     out.push({
       name: typeof s.scriptName === "string" && s.scriptName.trim() ? s.scriptName.trim() : "Imported regex",
       enabled: s.disabled !== true,
       findRegex: source,
       replaceString: typeof s.replaceString === "string" ? s.replaceString : "",
       trimStrings: Array.isArray(s.trimStrings) ? s.trimStrings.filter((t): t is string => typeof t === "string") : [],
-      placement: resolvedPlacement,
+      placement,
       flags,
-      // Imported scripts transform displayed messages, gated by the chat's Scoped
-      // Regex mode — they stay opt-in per chat rather than always rewriting prompts.
-      promptOnly: false,
+      promptOnly: s.promptOnly === true || s.prompt_only === true || s.onlyFormatPrompt === true,
       targetCharacterIds: scope === "global" ? [] : [characterId],
       // Preserve the card's authoring order so multi-script imports keep a stable
       // execution/list order (all-zero ties leave it undefined). Gaps from skipped
@@ -218,16 +223,19 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
   // Save avatar image if provided
   let avatarPath: string | undefined;
   if (avatarDataUrl && avatarDataUrl.startsWith("data:image/")) {
-    ensureAvatarDir();
-    const ext = avatarDataUrl.match(/^data:image\/([\w+]+);/)?.[1]?.replace("+xml", "") ?? "png";
-    const filename = `${randomUUID()}.${ext}`;
-    const filePath = join(AVATAR_DIR, filename);
-
     // Strip data URL header → raw base64
     const base64 = avatarDataUrl.split(",")[1];
     if (base64) {
-      await writeFile(filePath, Buffer.from(base64, "base64"));
-      avatarPath = `/api/avatars/file/${filename}`;
+      const declaredExt = avatarDataUrl.match(/^data:image\/([\w+]+);/)?.[1]?.replace("+xml", "");
+      const avatarBuffer = Buffer.from(base64, "base64");
+      const imageInfo = isAllowedImageBuffer(avatarBuffer, declaredExt ? `.${declaredExt}` : undefined);
+      if (imageInfo) {
+        ensureAvatarDir();
+        const filename = `${randomUUID()}.${imageInfo.ext}`;
+        const filePath = join(AVATAR_DIR, filename);
+        await writeFile(filePath, avatarBuffer);
+        avatarPath = `/api/avatars/file/${filename}`;
+      }
     }
   }
 
@@ -430,9 +438,12 @@ export async function importCharX(buf: Buffer, db: DB, options?: STCharacterImpo
       const entry = zip.getEntry(fallback);
       if (entry) {
         const ext = fallback.split(".").pop() ?? "png";
-        const mime = ext === "jpg" ? "jpeg" : ext;
-        avatarDataUrl = `data:image/${mime};base64,${entry.getData().toString("base64")}`;
-        break;
+        const data = entry.getData();
+        const imageInfo = isAllowedImageBuffer(data, `.${ext}`);
+        if (imageInfo) {
+          avatarDataUrl = `data:${imageInfo.mimeType};base64,${data.toString("base64")}`;
+          break;
+        }
       }
     }
   }
@@ -481,13 +492,14 @@ function normalizeCharacterData(raw: Record<string, unknown>): CharacterData {
     // V2 / V3 format — extract from data wrapper
     return normalizeV2(raw.data as Record<string, unknown>);
   }
+  if (raw.type === "character" && raw.data) {
+    // RisuAI format
+    const data = raw.data && typeof raw.data === "object" ? (raw.data as Record<string, unknown>) : {};
+    return convertRisuToV2({ ...raw, ...data });
+  }
   if (raw.char_name || raw.name) {
     // V1 / Pygmalion format — convert to V2
     return convertV1toV2(raw);
-  }
-  if (raw.type === "character" && raw.data) {
-    // RisuAI format
-    return convertRisuToV2((raw.data as Record<string, unknown>) ?? {});
   }
   // Try treating the whole object as character data
   return normalizeV2(raw);
@@ -533,6 +545,70 @@ function selectBestCharacterBook(...books: unknown[]): unknown {
 
   return best;
 }
+
+function normalizeCharacterBookPosition(value: unknown): CharacterBookEntryPosition {
+  if (typeof value === "string") {
+    if (value === "after_char" || value === "at_depth" || value === "depth") return value;
+    return "before_char";
+  }
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 6) {
+    return value as CharacterBookEntryPosition;
+  }
+  return "before_char";
+}
+
+function normalizeCharacterBookRole(value: unknown): CharacterBookEntryRole | undefined {
+  if (value === "system" || value === "user" || value === "assistant") return value;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2) {
+    return value as CharacterBookEntryRole;
+  }
+  return undefined;
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function pickDefinedFields(source: Record<string, unknown>, fields: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (source[field] !== undefined) picked[field] = source[field];
+  }
+  return picked;
+}
+
+const V3_CHARACTER_DATA_FIELDS = [
+  "group_only_greetings",
+  "nickname",
+  "assets",
+  "creation_date",
+  "source",
+  "creator_notes_multilingual",
+];
+
+const CHARACTER_BOOK_ENTRY_PASSTHROUGH_FIELDS = [
+  "probability",
+  "useProbability",
+  "use_probability",
+  "selectiveLogic",
+  "sticky",
+  "cooldown",
+  "delay",
+  "group",
+  "groupWeight",
+  "scanDepth",
+  "scan_depth",
+  "matchWholeWords",
+  "match_whole_words",
+  "caseSensitive",
+  "case_sensitive",
+  "useRegex",
+  "regex",
+  "preventRecursion",
+  "excludeRecursion",
+  "delayUntilRecursion",
+  "vectorized",
+];
 
 function buildCardSpecMetadata(raw: Record<string, unknown>) {
   const spec = typeof raw.spec === "string" ? raw.spec : null;
@@ -604,14 +680,15 @@ function resolveCharXAsset(zip: AdmZip, uri: string, ext?: string): string | nul
   const entry = zip.getEntry(zipPath);
   if (!entry) return null;
 
+  const data = entry.getData();
   const fileExt = ext ?? zipPath.split(".").pop() ?? "png";
-  const mime = fileExt === "jpg" ? "jpeg" : fileExt;
-  return `data:image/${mime};base64,${entry.getData().toString("base64")}`;
+  const imageInfo = isAllowedImageBuffer(data, `.${fileExt}`);
+  if (!imageInfo) return null;
+  return `data:${imageInfo.mimeType};base64,${data.toString("base64")}`;
 }
 
 function normalizeV2(raw: Record<string, unknown>): CharacterData {
-  const rawExtensions =
-    raw.extensions && typeof raw.extensions === "object" ? (raw.extensions as Record<string, unknown>) : {};
+  const rawExtensions = optionalRecord(raw.extensions);
   return {
     name: String(raw.name ?? "Unknown"),
     description: String(raw.description ?? ""),
@@ -642,6 +719,7 @@ function normalizeV2(raw: Record<string, unknown>): CharacterData {
       appearance: String(rawExtensions.appearance ?? ""),
     },
     character_book: normalizeCharacterBook(raw.character_book),
+    ...pickDefinedFields(raw, V3_CHARACTER_DATA_FIELDS),
   };
 }
 
@@ -668,16 +746,14 @@ function normalizeCharacterBook(raw: unknown): CharacterData["character_book"] {
   const book = raw as Record<string, unknown>;
 
   const entries = getCharacterBookEntries(book).map((e, i) => {
-    const posRaw = e.position;
-    let position: "before_char" | "after_char" = "before_char";
-    if (typeof posRaw === "string") {
-      position = posRaw === "after_char" ? "after_char" : "before_char";
-    } else if (typeof posRaw === "number") {
-      position = posRaw === 1 ? "after_char" : "before_char";
-    }
+    const position = normalizeCharacterBookPosition(e.position);
+    const depth = typeof e.depth === "number" && Number.isFinite(e.depth) ? e.depth : null;
+    const role = normalizeCharacterBookRole(e.role);
     const title = firstNonEmptyString(e.comment, e.name) ?? `Entry ${i + 1}`;
+    const passthrough = pickDefinedFields(e, CHARACTER_BOOK_ENTRY_PASSTHROUGH_FIELDS);
 
     return {
+      ...passthrough,
       keys: normalizeStringArray(e.key ?? e.keys),
       secondary_keys: normalizeStringArray(e.keysecondary ?? e.secondary_keys),
       content: String(e.content ?? ""),
@@ -692,6 +768,8 @@ function normalizeCharacterBook(raw: unknown): CharacterData["character_book"] {
       selective: Boolean(e.selective ?? false),
       constant: Boolean(e.constant ?? false),
       position,
+      ...(depth !== null ? { depth } : {}),
+      ...(role !== undefined ? { role } : {}),
     };
   });
 
@@ -728,21 +806,47 @@ function convertV1toV2(raw: Record<string, unknown>): CharacterData {
 }
 
 function convertRisuToV2(raw: Record<string, unknown>): CharacterData {
+  const risuExtensions: Record<string, unknown> = {
+    ...optionalRecord(raw.extensions),
+    ...pickDefinedFields(raw, [
+      "depth_prompt",
+      "depthPrompt",
+      "talkativeness",
+      "fav",
+      "world",
+      "regex_scripts",
+      "regexScripts",
+      "backstory",
+      "appearance",
+    ]),
+  };
+  if (risuExtensions.depth_prompt === undefined && raw.depthPrompt !== undefined) {
+    risuExtensions.depth_prompt = raw.depthPrompt;
+  }
+  if (risuExtensions.regex_scripts === undefined && raw.regexScripts !== undefined) {
+    risuExtensions.regex_scripts = raw.regexScripts;
+  }
+
   return normalizeV2({
     name: raw.name ?? "Unknown",
     description: raw.description ?? "",
     personality: raw.personality ?? "",
     scenario: raw.scenario ?? "",
-    first_mes: raw.firstMessage ?? raw.first_mes ?? "",
-    mes_example: raw.exampleMessage ?? raw.mes_example ?? "",
+    first_mes: raw.firstMessage ?? raw.first_mes ?? raw.first_message ?? "",
+    mes_example: raw.exampleMessage ?? raw.mes_example ?? raw.example_dialogue ?? "",
     system_prompt: raw.systemPrompt ?? "",
     creator_notes: raw.creatorNotes ?? "",
-    post_history_instructions: "",
+    post_history_instructions:
+      raw.postHistoryInstructions ?? raw.post_history_instructions ?? raw.jailbreak ?? raw.jailbreakPrompt ?? "",
     tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
     creator: String(raw.creator ?? ""),
-    character_version: "",
-    alternate_greetings: Array.isArray(raw.alternateGreetings) ? raw.alternateGreetings.map(String) : [],
-    extensions: {},
-    character_book: null,
+    character_version: raw.characterVersion ?? raw.character_version ?? "",
+    alternate_greetings: Array.isArray(raw.alternateGreetings)
+      ? raw.alternateGreetings.map(String)
+      : Array.isArray(raw.alternate_greetings)
+        ? raw.alternate_greetings.map(String)
+        : [],
+    extensions: risuExtensions,
+    character_book: raw.character_book ?? raw.characterBook ?? raw.lorebook ?? raw.world_info ?? raw.worldInfo ?? null,
   });
 }

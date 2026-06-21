@@ -21,6 +21,8 @@ const EXPRESSION_AGENT_CONTEXT_CHAR_LIMIT = 1200;
 const EXPRESSION_AGENT_RESPONSE_CHAR_LIMIT = 6000;
 const CHARACTER_LORE_DESCRIPTION_LIMIT = 2000;
 const CHARACTER_LORE_FIELD_LIMIT = 1200;
+const DEFAULT_AGENT_TEMPERATURE = 0.3;
+const DEFAULT_AGENT_CALL_TIMEOUT_MS = 5 * 60_000;
 
 /** Strip HTML/XML-style tags (e.g. <div style="..."> <br> <speaker>) from text to save tokens. */
 function stripHtmlTags(text: string): string {
@@ -48,6 +50,8 @@ export interface AgentExecConfig {
   promptTemplate: string;
   connectionId: string | null;
   settings: Record<string, unknown>;
+  customParameters?: Record<string, unknown>;
+  maxOutputTokens?: number | null;
 }
 
 /** Optional tool context for agents that need function calling. */
@@ -106,10 +110,16 @@ function readAgentSettingPath(settings: Record<string, unknown>, path: string): 
   return { found: true, value: cursor };
 }
 
-function renderAgentSettingsMacros(template: string, settings: Record<string, unknown>): string {
+function renderAgentSettingsMacros(
+  template: string,
+  settings: Record<string, unknown>,
+  options: { escapeValues?: boolean } = {},
+): string {
   return template.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, key: string) => {
     const { found, value } = readAgentSettingPath(settings, key);
-    return found ? stringifyAgentSettingMacroValue(value) : match;
+    if (!found) return match;
+    const rendered = stringifyAgentSettingMacroValue(value);
+    return options.escapeValues ? escapeXml(rendered) : rendered;
   });
 }
 
@@ -198,8 +208,48 @@ function normalizeAgentMaxTokens(value: unknown, fallback = DEFAULT_AGENT_MAX_TO
   return Math.max(MIN_AGENT_MAX_TOKENS, Math.trunc(parsed));
 }
 
+function normalizeAgentTemperature(value: unknown, fallback = DEFAULT_AGENT_TEMPERATURE): number {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(2, parsed));
+}
+
+function agentCustomParameters(config: AgentExecConfig): Record<string, unknown> | undefined {
+  return config.customParameters && Object.keys(config.customParameters).length > 0
+    ? config.customParameters
+    : undefined;
+}
+
+function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
+  const activeSignals = signals.filter((signal) => !signal.aborted);
+  const abortedSignal = signals.find((signal) => signal.aborted);
+  if (abortedSignal) return abortedSignal;
+  if (activeSignals.length === 1) return activeSignals[0]!;
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(activeSignals);
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of activeSignals) {
+    signal.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
+function agentCallSignal(parentSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(DEFAULT_AGENT_CALL_TIMEOUT_MS);
+  return parentSignal ? combineAbortSignals([parentSignal, timeoutSignal]) : timeoutSignal;
+}
+
 function applyProviderMaxTokensOverride(provider: BaseLLMProvider, maxTokens: number): number {
   return provider.maxTokensOverrideValue !== null ? Math.min(maxTokens, provider.maxTokensOverrideValue) : maxTokens;
+}
+
+function applyAgentMaxTokensCaps(provider: BaseLLMProvider, maxTokens: number, modelMaxOutput: unknown): number {
+  const cappedByConnection = applyProviderMaxTokensOverride(provider, maxTokens);
+  if (typeof modelMaxOutput !== "number" || !Number.isFinite(modelMaxOutput) || modelMaxOutput <= 0) {
+    return cappedByConnection;
+  }
+  return Math.min(cappedByConnection, Math.floor(modelMaxOutput));
 }
 
 function debugMessages(messages: ChatMessage[]): AgentCallDebugEvent["messages"] {
@@ -296,9 +346,14 @@ export async function executeAgent(
             : buildStandardAgentMessages(config, template, context);
 
     // Agents use lower temperature for reliability
-    const temperature = (config.settings.temperature as number) ?? 0.3;
-    const maxTokens = applyProviderMaxTokensOverride(provider, normalizeAgentMaxTokens(config.settings.maxTokens));
+    const temperature = normalizeAgentTemperature(config.settings.temperature);
+    const maxTokens = applyAgentMaxTokensCaps(
+      provider,
+      normalizeAgentMaxTokens(config.settings.maxTokens),
+      config.maxOutputTokens,
+    );
     const streamResponses = context.streaming !== false;
+    const customParameters = agentCustomParameters(config);
 
     // If tools are available, use the tool call loop.
     // `await` so a rethrow from the tool loop is caught by this function's
@@ -338,13 +393,14 @@ export async function executeAgent(
       model,
       temperature,
       maxTokens,
+      customParameters,
       stream: streamResponses,
       onToken: streamResponses
         ? (chunk) => {
             responseText += chunk;
           }
         : undefined,
-      signal: context.signal,
+      signal: agentCallSignal(context.signal),
     });
 
     if (!responseText && result.content) responseText = result.content;
@@ -380,13 +436,14 @@ export async function executeAgent(
         model,
         temperature,
         maxTokens,
+        customParameters,
         stream: streamResponses,
         onToken: streamResponses
           ? (chunk) => {
               retryResponseText += chunk;
             }
           : undefined,
-        signal: context.signal,
+        signal: agentCallSignal(context.signal),
       });
       totalTokens += retryResult.usage?.totalTokens ?? 0;
       if (!retryResponseText && retryResult.content) retryResponseText = retryResult.content;
@@ -427,7 +484,7 @@ export async function executeAgent(
       ...agentDebugBase(
         config,
         model,
-        (config.settings.temperature as number) ?? 0.3,
+        normalizeAgentTemperature(config.settings.temperature),
         normalizeAgentMaxTokens(config.settings.maxTokens),
       ),
       messageCount: 0,
@@ -458,6 +515,7 @@ async function executeAgentWithTools(
   const loopMessages = [...initialMessages];
   let totalTokens = 0;
   const debugAgentsEnabled = isDebugAgentsEnabled() && logger.isLevelEnabled("debug");
+  const customParameters = agentCustomParameters(config);
 
   for (let round = 0; round < maxToolRounds; round++) {
     emitAgentDebug(context, {
@@ -472,9 +530,10 @@ async function executeAgentWithTools(
       model,
       temperature,
       maxTokens,
+      customParameters,
       stream: streamResponses,
       tools: toolContext.tools,
-      signal: context.signal,
+      signal: agentCallSignal(context.signal),
     });
 
     totalTokens += result.usage?.totalTokens ?? 0;
@@ -552,8 +611,9 @@ async function executeAgentWithTools(
     model,
     temperature,
     maxTokens,
+    customParameters,
     stream: streamResponses,
-    signal: context.signal,
+    signal: agentCallSignal(context.signal),
   });
   totalTokens += finalResult.usage?.totalTokens ?? 0;
   const responseText = finalResult.content?.trim() ?? "";
@@ -651,9 +711,11 @@ export async function executeAgentBatch(
 
   const startTime = Date.now();
   const perAgentTokens = configs.map((c) => normalizeAgentMaxTokens(c.settings.maxTokens));
-  const temperature = Math.min(...configs.map((c) => (c.settings.temperature as number) ?? 0.3));
+  const temperature = Math.min(...configs.map((c) => normalizeAgentTemperature(c.settings.temperature)));
+  const customParameters = agentCustomParameters(configs[0]!);
   const rawBatchMaxTokens = perAgentTokens.reduce((sum, tokens) => sum + tokens, 0);
-  const batchMaxTokens = applyProviderMaxTokensOverride(provider, rawBatchMaxTokens);
+  const modelMaxOutput = configs[0]!.maxOutputTokens;
+  const batchMaxTokens = applyAgentMaxTokensCaps(provider, rawBatchMaxTokens, modelMaxOutput);
 
   try {
     // Build merged system prompt (includes lore + agent extras)
@@ -670,10 +732,19 @@ export async function executeAgentBatch(
 
     // Each agent reserves its own configured output budget. The context fitter
     // may still reduce this further if the prompt needs more room.
-    const streamResponses = context.streaming !== false;
-    logger.info(
-      `[agent-batch] maxTokens: ${batchMaxTokens} (sum=${rawBatchMaxTokens} from [${perAgentTokens.join(", ")}]${provider.maxTokensOverrideValue !== null ? `, capped at ${provider.maxTokensOverrideValue}` : ""})`,
-    );
+  const streamResponses = context.streaming !== false;
+  const capDetails = [
+    provider.maxTokensOverrideValue !== null ? `connection cap=${provider.maxTokensOverrideValue}` : null,
+    modelMaxOutput ? `model cap=${modelMaxOutput}` : null,
+  ].filter(Boolean);
+  const capSuffix = capDetails.length ? `, ${capDetails.join(", ")}` : "";
+  logger.info(
+    "[agent-batch] maxTokens: %d (sum=%d from [%s]%s)",
+    batchMaxTokens,
+    rawBatchMaxTokens,
+    perAgentTokens.join(", "),
+    capSuffix,
+  );
 
     logger.debug(`\n[agent-batch] ═══ BATCH PROMPT — [${configs.map((c) => c.type).join(", ")}] — ${model} ═══`);
     for (const msg of messages) {
@@ -701,13 +772,14 @@ export async function executeAgentBatch(
       model,
       temperature,
       maxTokens: batchMaxTokens,
+      customParameters,
       stream: streamResponses,
       onToken: streamResponses
         ? (chunk) => {
             responseText += chunk;
           }
         : undefined,
-      signal: context.signal,
+      signal: agentCallSignal(context.signal),
     });
 
     // chatComplete also accumulates content, but streaming via onToken is
@@ -820,9 +892,10 @@ function buildBatchSystemPrompt(configs: AgentExecConfig[], context: AgentContex
     const template = renderAgentSettingsMacros(
       config.promptTemplate || getDefaultPromptForAgent(config),
       config.settings,
+      { escapeValues: true },
     );
     parts.push(``);
-    parts.push(`<agent_task id="${config.type}" name="${config.name}">`);
+    parts.push(`<agent_task id="${escapeXmlAttribute(config.type)}" name="${escapeXmlAttribute(config.name)}">`);
     parts.push(template);
     parts.push(`</agent_task>`);
   }
@@ -844,14 +917,20 @@ function buildBatchSystemPrompt(configs: AgentExecConfig[], context: AgentContex
   for (const config of configs) {
     const isJson = agentResponseIsJson(config);
     parts.push(
-      `<result agent="${config.type}">`,
+      `<result agent="${escapeXmlAttribute(config.type)}">`,
       isJson ? `{ ... valid JSON ... }` : `... your text output ...`,
       `</result>`,
     );
   }
   parts.push(``);
+  const escapedAgentIds = configs.map((config) => escapeXml(config.type)).join(", ");
   parts.push(
-    `CRITICAL: Output ALL ${configs.length} result blocks. Use exact agent IDs: ${configs.map((c) => c.type).join(", ")}. JSON agents must output valid JSON (no markdown fences). No text outside <result> blocks.`,
+    [
+      `CRITICAL: Output ALL ${configs.length} result blocks.`,
+      `Use exact agent IDs: ${escapedAgentIds}.`,
+      "JSON agents must output valid JSON (no markdown fences).",
+      "No text outside <result> blocks.",
+    ].join(" "),
   );
 
   return parts.join("\n");
@@ -871,37 +950,17 @@ function parseBatchResponse(
   const perAgentTokens = Math.round(totalTokens / configs.length);
   const parsed: AgentResult[] = [];
   const failed: AgentExecConfig[] = [];
+  const expectedAgentTypes = new Set(configs.map((config) => config.type));
+  const resultBlocks = extractResultBlocks(responseText);
+  const explicitResults = new Map<string, string>();
+  for (const block of resultBlocks) {
+    if (!expectedAgentTypes.has(block.agent) || explicitResults.has(block.agent)) continue;
+    explicitResults.set(block.agent, block.content.trim());
+  }
+  const residualText = removeSpans(responseText, resultBlocks.map((block) => [block.start, block.end] as const));
 
   for (const config of configs) {
-    const escaped = escapeRegex(config.type);
-    // Try several patterns the model might use:
-    // 1. <result agent="type">...</result>
-    // 2. <result agent='type'>...</result>
-    // 3. <result agent=type>...</result>  (unquoted)
-    // 4. <result_type>...</result_type>   (underscore variant)
-    // 5. <type>...</type>                 (bare agent ID as tag)
-    //
-    // We use GREEDY match ([\s\S]*) with a lookahead for the closing tag
-    // or the next <result to avoid stopping at a </result> inside JSON strings.
-    const patterns = [
-      new RegExp(
-        `<result\\s+agent\\s*=\\s*["']${escaped}["']\\s*>([\\s\\S]*?)</result\\s*>(?=\\s*(?:<result\\b|$))`,
-        "i",
-      ),
-      new RegExp(`<result\\s+agent\\s*=\\s*["']${escaped}["']\\s*>([\\s\\S]*?)</result>`, "i"),
-      new RegExp(`<result\\s+agent\\s*=\\s*${escaped}\\s*>([\\s\\S]*?)</result>`, "i"),
-      new RegExp(`<result_${escaped}>([\\s\\S]*?)</result_${escaped}>`, "i"),
-      new RegExp(`<${escaped}>([\\s\\S]*?)</${escaped}>`, "i"),
-    ];
-
-    let matchedOutput: string | null = null;
-    for (const pattern of patterns) {
-      const match = responseText.match(pattern);
-      if (match) {
-        matchedOutput = match[1]!.trim();
-        break;
-      }
-    }
+    const matchedOutput = explicitResults.get(config.type) ?? matchLegacyResultTag(config.type, residualText);
 
     if (matchedOutput !== null) {
       const parsedResult = parseAgentResponse(config, matchedOutput);
@@ -931,6 +990,82 @@ function parseBatchResponse(
   }
 
   return { parsed, failed };
+}
+
+type ExtractedResultBlock = {
+  agent: string;
+  content: string;
+  start: number;
+  end: number;
+};
+
+function extractResultBlocks(responseText: string): ExtractedResultBlock[] {
+  const openRegex = /<result\b([^>]*)>/gi;
+  const opens = Array.from(responseText.matchAll(openRegex));
+  const blocks: ExtractedResultBlock[] = [];
+
+  for (let i = 0; i < opens.length; i++) {
+    const open = opens[i]!;
+    const agent = readResultAgentAttribute(open[1] ?? "");
+    if (!agent) continue;
+
+    const contentStart = open.index + open[0].length;
+    const nextStart = opens[i + 1]?.index ?? responseText.length;
+    const closeRegex = /<\/result\s*>/gi;
+    closeRegex.lastIndex = contentStart;
+
+    let selectedClose: RegExpExecArray | null = null;
+    let closeMatch: RegExpExecArray | null;
+    while ((closeMatch = closeRegex.exec(responseText))) {
+      if (closeMatch.index >= nextStart) break;
+      selectedClose = closeMatch;
+    }
+    if (!selectedClose) continue;
+
+    blocks.push({
+      agent,
+      content: responseText.slice(contentStart, selectedClose.index),
+      start: open.index,
+      end: selectedClose.index + selectedClose[0].length,
+    });
+  }
+
+  return blocks;
+}
+
+function readResultAgentAttribute(attributes: string): string | null {
+  const match = attributes.match(/\bagent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+  const raw = match?.[1] ?? match?.[2] ?? match?.[3];
+  return raw ? decodeXmlAttribute(raw).trim() : null;
+}
+
+function decodeXmlAttribute(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function removeSpans(value: string, spans: ReadonlyArray<readonly [number, number]>): string {
+  if (spans.length === 0) return value;
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const [start, end] of sorted) {
+    if (start > cursor) parts.push(value.slice(cursor, start));
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < value.length) parts.push(value.slice(cursor));
+  return parts.join("");
+}
+
+function matchLegacyResultTag(agentType: string, residualText: string): string | null {
+  if (!/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(agentType)) return null;
+  const escaped = escapeRegex(agentType);
+  const match = residualText.match(new RegExp(`<result_${escaped}>([\\s\\S]*?)</result_${escaped}>`, "i"));
+  return match?.[1]?.trim() ?? null;
 }
 
 function escapeRegex(str: string): string {

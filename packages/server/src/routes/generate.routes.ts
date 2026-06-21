@@ -23,6 +23,8 @@ import {
   normalizeAgentPromptTemplateSelectionMap,
   normalizeThinkingTagPairs,
   applyTrackerFieldLocksToGameStatePatch,
+  normalizeTrackerFieldLocksForState,
+  trackerFieldLocksAreEmpty,
   customAgentHasCapability,
   supportsXhighReasoningEffort,
   DEFAULT_CONVERSATION_PROMPT,
@@ -30,6 +32,8 @@ import {
   unwrapConversationInstructions,
   wrapConversationInstructions,
   NARRATIVE_DIRECTOR_SECRET_PLOT_PROMPT,
+  findKnownModel,
+  type APIProvider,
 } from "@marinara-engine/shared";
 import type {
   AgentContext,
@@ -194,6 +198,7 @@ import {
   isMessageHiddenFromAI,
   mergeCustomParameters,
   parseExtra,
+  parseJsonField,
   parseStoredGenerationParameters,
   parseGameStateRow,
   parseSnapshotPlayerStats,
@@ -420,6 +425,7 @@ function customAgentCanEmitResult(
     case "character_tracker_update":
     case "persona_stats_update":
     case "custom_tracker_update":
+    case "quest_update":
       return customAgentCanApplyResult(result, agents, builtInAgentTypes, "edit_trackers");
     case "image_prompt":
       return customAgentCanApplyResult(result, agents, builtInAgentTypes, "trigger_image_generation");
@@ -783,6 +789,30 @@ async function isConversationYoutubeCommandAvailable(storage: {
   const agent = (await storage.getByType("spotify")) ?? (await storage.getByType("youtube"));
   const settings = parseStoredAgentSettingsValue(agent?.settings);
   return typeof settings.youtubeApiKey === "string" && settings.youtubeApiKey.trim().length > 0;
+}
+
+function resolveKnownMaxOutputTokens(provider: APIProvider | string | null | undefined, model: string): number | null {
+  const knownModel = provider ? findKnownModel(provider as APIProvider, model.trim()) : undefined;
+  return knownModel?.maxOutput && knownModel.maxOutput > 0 ? Math.floor(knownModel.maxOutput) : null;
+}
+
+function clampGenerationMaxOutputTokens(args: {
+  provider: APIProvider | string | null | undefined;
+  model: string;
+  maxTokens: number;
+  maxTokensOverride?: number | null;
+}): number {
+  let capped = Math.max(1, Math.floor(args.maxTokens));
+  const knownMaxOutput = resolveKnownMaxOutputTokens(args.provider, args.model);
+  if (knownMaxOutput !== null) capped = Math.min(capped, knownMaxOutput);
+  if (
+    typeof args.maxTokensOverride === "number" &&
+    Number.isFinite(args.maxTokensOverride) &&
+    args.maxTokensOverride > 0
+  ) {
+    capped = Math.min(capped, Math.floor(args.maxTokensOverride));
+  }
+  return capped;
 }
 
 /** Fisher-Yates shuffle (in place); used for random emoji selection. */
@@ -3466,12 +3496,15 @@ export async function generateRoutes(app: FastifyInstance) {
           verbosity = "high";
         }
 
-        // Game mode: force optimal generation defaults (ignore preset/chat overrides)
-        // unless the user is running a local Gemma model where these don't apply.
         const isLocalGemma = (conn.model ?? "").toLowerCase().includes("gemma");
+        applyParameterOverrides(connectionParams);
+        applyParameterOverrides(chatParams);
+
+        // Game mode: force optimal generation defaults after Advanced Parameters
+        // so leftover chat/connection overrides cannot sabotage structured GM output.
         if (chatMode === "game" && !isLocalGemma) {
           temperature = 1;
-          maxTokens = 16384;
+          maxTokens = 16_384;
           topP = 1;
           topK = 0;
           minP = 0;
@@ -3480,14 +3513,20 @@ export async function generateRoutes(app: FastifyInstance) {
           reasoningEffort = "maximum";
           verbosity = null;
         } else if (chatMode === "game") {
-          // Local Gemma: just ensure generous output
+          // Local Gemma: just ensure generous output unless the chat set its own budget.
           if (typeof chatParams?.maxTokens !== "number") {
-            maxTokens = Math.max(maxTokens, 16384);
+            maxTokens = Math.max(maxTokens, 16_384);
           }
         }
 
-        applyParameterOverrides(connectionParams);
-        applyParameterOverrides(chatParams);
+        if (chatMode === "game") {
+          maxTokens = clampGenerationMaxOutputTokens({
+            provider: conn.provider,
+            model: conn.model,
+            maxTokens: Math.max(maxTokens, 16_384),
+            maxTokensOverride: conn.maxTokensOverride,
+          });
+        }
 
         const modelLower = (conn.model ?? "").toLowerCase();
         const providerLower = (conn.provider ?? "").toLowerCase();
@@ -3565,6 +3604,11 @@ export async function generateRoutes(app: FastifyInstance) {
         );
 
         const chatConnectionMaxParallelJobs = Number(conn.maxParallelJobs) || 1;
+        const chatConnectionKnownModel = findKnownModel(conn.provider as APIProvider, conn.model.trim());
+        const chatConnectionMaxOutputTokens =
+          chatConnectionKnownModel?.maxOutput && chatConnectionKnownModel.maxOutput > 0
+            ? Math.floor(chatConnectionKnownModel.maxOutput)
+            : null;
         const { enabledConfigs, resolvedAgents, agentConnectionWarnings } = await resolveAgentPipelineAgents({
           connections,
           configuredAgents: configuredPromptAgents,
@@ -3575,6 +3619,8 @@ export async function generateRoutes(app: FastifyInstance) {
           agentPromptTemplateSelections,
           chatProvider: provider,
           chatModel: conn.model,
+          chatCustomParameters: connectionParams?.customParameters ?? {},
+          chatMaxOutputTokens: chatConnectionMaxOutputTokens,
           chatMaxParallelJobs: chatConnectionMaxParallelJobs,
           activeMusicPlayerSource,
           chatMetadata: chatMeta,
@@ -3583,7 +3629,7 @@ export async function generateRoutes(app: FastifyInstance) {
 
         const builtInAgentTypes = new Set(BUILT_IN_AGENTS.map((agent) => agent.id));
         const userMessagesSinceLastAgentRun = async (agentType: string) => {
-          const lastRun = await agentsStore.getLastRunByType(agentType, input.chatId);
+          const lastRun = await agentsStore.getLastSuccessfulRunByType(agentType, input.chatId);
           if (!lastRun) return Number.POSITIVE_INFINITY;
 
           const lastRunIdx = allChatMessages.findIndex((message: any) => message.id === lastRun.messageId);
@@ -4185,8 +4231,9 @@ export async function generateRoutes(app: FastifyInstance) {
         );
 
         // Batch-fetch committed game state snapshots for assistant messages in the agent context
-        const assistantMsgIds = agentSlice.filter((m: any) => m.role === "assistant").map((m: any) => m.id as string);
-        const committedSnapshots = await gameStateStore.getCommittedForMessages(assistantMsgIds);
+        const committedSnapshots = await gameStateStore.getCommittedForMessages(
+          agentSlice.filter((m: any) => m.role === "assistant"),
+        );
         const visibleHistorySnapshot =
           latestGameState &&
           visibleGameStateAnchor &&
@@ -4661,10 +4708,12 @@ export async function generateRoutes(app: FastifyInstance) {
                 {};
               // Skip:
               //   - Disabled entries (off-limits, by global flag or per-chat override).
+              //   - Chat-active constant entries, which are already injected by the standard lorebook path.
               //   - Exhausted ephemeral entries (countdown reached 0 in this chat).
               //   - Entries excluded by character/tag/generation-trigger filters.
               knowledgeRouterEntries = entries
                 .filter((e: LorebookEntry) => {
+                  if (source === "chat_active" && e.constant === true) return false;
                   const ov = entryStateOverrides[e.id];
                   const isEnabled = ov?.enabled ?? e.enabled !== false;
                   if (!isEnabled) return false;
@@ -5902,7 +5951,11 @@ export async function generateRoutes(app: FastifyInstance) {
           fullResponse = "";
           fullThinking = "";
           providerThinking = "";
-          if (tailMessages.assistantPrefillInjected && assistantPrefill) {
+          if (
+            tailMessages.assistantPrefillInjected &&
+            !tailMessages.googleUserRegenerationInjected &&
+            assistantPrefill
+          ) {
             await writeContentChunked(assistantPrefill);
           }
           let geminiResponseParts: unknown[] | null = null;
@@ -7425,6 +7478,15 @@ export async function generateRoutes(app: FastifyInstance) {
             const refreshedForSwipe = await chats.getMessage(messageId);
             if (refreshedForSwipe) targetSwipeIndex = refreshedForSwipe.activeSwipeIndex ?? 0;
           }
+          const siblingSwipeSnapshot =
+            input.regenerateMessageId && messageId && targetSwipeIndex > 0
+              ? await gameStateStore.getByMessage(messageId, targetSwipeIndex - 1)
+              : null;
+          const trackerBaseGameStateSnapshot = siblingSwipeSnapshot ?? baseGameStateSnapshot;
+          const serializeMigratedTrackerLocks = (state: ReturnType<typeof parseGameStateRow> | null) => {
+            const locks = normalizeTrackerFieldLocksForState(state?.fieldLocks, state);
+            return trackerFieldLocksAreEmpty(locks) ? null : JSON.stringify(locks);
+          };
 
           const resolveAgentImageConnectionId = async (agent: ResolvedAgent | undefined): Promise<string | null> => {
             let imgConnId = (agent?.settings?.imageConnectionId as string) ?? null;
@@ -7734,6 +7796,7 @@ export async function generateRoutes(app: FastifyInstance) {
             if (
               result.success &&
               result.type === "game_state_update" &&
+              result.agentType !== "combat" &&
               result.data &&
               typeof result.data === "object" &&
               customAgentCanApplyResult(result, resolvedAgents, builtInAgentTypes, "edit_trackers")
@@ -7746,7 +7809,7 @@ export async function generateRoutes(app: FastifyInstance) {
                 // are NOT carried forward to new snapshots.  The agent naturally reads
                 // the edited prevSnap values and produces its own output.
                 const prevSnap =
-                  baseGameStateSnapshot ??
+                  trackerBaseGameStateSnapshot ??
                   (allowLatestGameStateFallback ? await gameStateStore.getLatest(input.chatId) : null);
 
                 // Build the new snapshot from agent output, falling back to previous snapshot.
@@ -7767,21 +7830,9 @@ export async function generateRoutes(app: FastifyInstance) {
                 // these fields from the previous snapshot — the dedicated tracker agents
                 // (character-tracker, persona-stats, quest, custom-tracker) will update
                 // them with authoritative data in their own handler blocks below.
-                const snapshotChars = prevSnap?.presentCharacters
-                  ? typeof prevSnap.presentCharacters === "string"
-                    ? JSON.parse(prevSnap.presentCharacters)
-                    : prevSnap.presentCharacters
-                  : [];
-                const snapshotPersonaStats = prevSnap?.personaStats
-                  ? typeof prevSnap.personaStats === "string"
-                    ? JSON.parse(prevSnap.personaStats)
-                    : prevSnap.personaStats
-                  : null;
-                const snapshotPlayerStats = prevSnap?.playerStats
-                  ? typeof prevSnap.playerStats === "string"
-                    ? JSON.parse(prevSnap.playerStats)
-                    : prevSnap.playerStats
-                  : null;
+                const snapshotChars = parseJsonField<any[]>(prevSnap?.presentCharacters, []);
+                const snapshotPersonaStats = parseJsonField<any[] | null>(prevSnap?.personaStats, null);
+                const snapshotPlayerStats = parseJsonField<PlayerStats | null>(prevSnap?.playerStats, null);
                 const currentGameStateForLocks = prevSnap
                   ? parseGameStateRow(prevSnap as Record<string, unknown>)
                   : null;
@@ -7817,7 +7868,10 @@ export async function generateRoutes(app: FastifyInstance) {
                     recentEvents: (gs.recentEvents as string[]) ?? [],
                     playerStats: snapshotPlayerStats,
                     personaStats: snapshotPersonaStats,
-                    fieldLocks: currentGameStateForLocks?.fieldLocks ?? null,
+                    fieldLocks: normalizeTrackerFieldLocksForState(
+                      currentGameStateForLocks?.fieldLocks,
+                      currentGameStateForLocks,
+                    ),
                   },
                   null, // manual overrides are one-shot — never carry forward
                 );
@@ -7866,8 +7920,8 @@ export async function generateRoutes(app: FastifyInstance) {
                     ),
                   );
                 }
-              } catch {
-                // Non-critical
+              } catch (err) {
+                logger.error(err, "[generate] Failed to apply world-state tracker update");
               }
             }
 
@@ -7881,17 +7935,17 @@ export async function generateRoutes(app: FastifyInstance) {
             ) {
               try {
                 const ctData = result.data as Record<string, unknown>;
-                let chars = (ctData.presentCharacters as any[]) ?? [];
+                if (!Array.isArray(ctData.presentCharacters) || ctData.presentCharacters.length === 0) {
+                  logger.debug("[generate] character-tracker emitted no presentCharacters; keeping existing snapshot");
+                  continue;
+                }
+                let chars = ctData.presentCharacters as any[];
                 const snapBeforeUpdate = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                 const previousCharacterSnapshot =
                   snapBeforeUpdate ??
-                  baseGameStateSnapshot ??
+                  trackerBaseGameStateSnapshot ??
                   (allowLatestGameStateFallback ? await gameStateStore.getLatest(input.chatId) : null);
-                const oldChars: any[] = previousCharacterSnapshot?.presentCharacters
-                  ? typeof previousCharacterSnapshot.presentCharacters === "string"
-                    ? JSON.parse(previousCharacterSnapshot.presentCharacters)
-                    : previousCharacterSnapshot.presentCharacters
-                  : [];
+                const oldChars = parseJsonField<any[]>(previousCharacterSnapshot?.presentCharacters, []);
                 preserveTrackerCharacterUiFields(chars, oldChars);
                 const characterLockState = previousCharacterSnapshot
                   ? parseGameStateRow(previousCharacterSnapshot as Record<string, unknown>)
@@ -8040,7 +8094,8 @@ export async function generateRoutes(app: FastifyInstance) {
 
                         // Re-persist with avatar paths and notify client
                         const latestAvatarSnapshot =
-                          (await gameStateStore.getByMessage(messageId, targetSwipeIndex)) ?? baseGameStateSnapshot;
+                          (await gameStateStore.getByMessage(messageId, targetSwipeIndex)) ??
+                          trackerBaseGameStateSnapshot;
                         const latestAvatarState = latestAvatarSnapshot
                           ? parseGameStateRow(latestAvatarSnapshot as Record<string, unknown>)
                           : null;
@@ -8067,7 +8122,7 @@ export async function generateRoutes(app: FastifyInstance) {
                             presentCharacters,
                           },
                           undefined,
-                          { baseSnapshot: baseGameStateSnapshot },
+                          { baseSnapshot: trackerBaseGameStateSnapshot },
                         );
                         try {
                           logger.debug(
@@ -8095,7 +8150,7 @@ export async function generateRoutes(app: FastifyInstance) {
                     presentCharacters: chars,
                   },
                   undefined,
-                  { baseSnapshot: baseGameStateSnapshot },
+                  { baseSnapshot: trackerBaseGameStateSnapshot },
                 );
                 logger.info(
                   `[generate] character-tracker: updateByMessage returned ${updated ? "ok" : "null (no snapshot)"}`,
@@ -8153,9 +8208,12 @@ export async function generateRoutes(app: FastifyInstance) {
             ) {
               try {
                 const psData = result.data as Record<string, unknown>;
-                const bars = (psData.stats as any[]) ?? [];
-                const status = (psData.status as string) ?? "";
-                const inventory = (psData.inventory as any[]) ?? [];
+                const hasStats = Array.isArray(psData.stats);
+                const hasStatus = typeof psData.status === "string";
+                const hasInventory = Array.isArray(psData.inventory);
+                const bars = hasStats ? (psData.stats as any[]) : [];
+                const status = hasStatus ? (psData.status as string) : "";
+                const inventory = hasInventory ? (psData.inventory as any[]) : [];
 
                 // Ensure a snapshot exists for this (messageId, swipeIndex).
                 // If world-state didn't create one, updateByMessage clones the
@@ -8163,21 +8221,25 @@ export async function generateRoutes(app: FastifyInstance) {
                 let snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                 if (!snap) {
                   await gameStateStore.updateByMessage(messageId, targetSwipeIndex, input.chatId, {}, undefined, {
-                    baseSnapshot: baseGameStateSnapshot,
+                    baseSnapshot: trackerBaseGameStateSnapshot,
                   });
                   snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                 }
+                const personaLockState = snap ? parseGameStateRow(snap as Record<string, unknown>) : null;
                 const personaPatch = buildLockedPersonaTrackerPatch({
                   stats: bars,
                   status,
                   inventory,
+                  hasStats,
+                  hasStatus,
+                  hasInventory,
                   snapshot: snap,
-                  lockState: snap ? parseGameStateRow(snap as Record<string, unknown>) : null,
+                  lockState: personaLockState,
                 });
                 if (snap && Object.keys(personaPatch.updates).length > 0) {
                   await app.db
                     .update(gameStateSnapshotsTable)
-                    .set(personaPatch.updates)
+                    .set({ ...personaPatch.updates, fieldLocks: serializeMigratedTrackerLocks(personaLockState) })
                     .where(eq(gameStateSnapshotsTable.id, snap.id));
                 }
                 if (personaPatch.changed) {
@@ -8203,8 +8265,8 @@ export async function generateRoutes(app: FastifyInstance) {
                     }
                   }
                 }
-              } catch {
-                // Non-critical
+              } catch (err) {
+                logger.error(err, "[generate] Failed to apply persona-stats tracker update");
               }
             }
 
@@ -8218,26 +8280,31 @@ export async function generateRoutes(app: FastifyInstance) {
             ) {
               try {
                 const ctData = result.data as Record<string, unknown>;
-                const rawFields = (ctData.fields as any[]) ?? [];
-                if (rawFields.length > 0) {
+                const hasFields = Array.isArray(ctData.fields);
+                const rawFields = hasFields ? (ctData.fields as any[]) : [];
+                if (hasFields) {
                   // Ensure a snapshot exists for this (messageId, swipeIndex)
                   let snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                   if (!snap) {
                     await gameStateStore.updateByMessage(messageId, targetSwipeIndex, input.chatId, {}, undefined, {
-                      baseSnapshot: baseGameStateSnapshot,
+                      baseSnapshot: trackerBaseGameStateSnapshot,
                     });
                     snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                   }
+                  const customLockState = snap ? parseGameStateRow(snap as Record<string, unknown>) : null;
                   const customTrackerPatch = buildLockedPlayerStatsArrayPatch<any>({
                     field: "customTrackerFields",
                     values: rawFields,
                     snapshot: snap,
-                    lockState: snap ? parseGameStateRow(snap as Record<string, unknown>) : null,
+                    lockState: customLockState,
                   });
                   if (snap && customTrackerPatch.changed) {
                     await app.db
                       .update(gameStateSnapshotsTable)
-                      .set({ playerStats: JSON.stringify(customTrackerPatch.playerStats) })
+                      .set({
+                        playerStats: JSON.stringify(customTrackerPatch.playerStats),
+                        fieldLocks: serializeMigratedTrackerLocks(customLockState),
+                      })
                       .where(eq(gameStateSnapshotsTable.id, snap.id));
                   }
                   if (customTrackerPatch.changed) {
@@ -8247,8 +8314,8 @@ export async function generateRoutes(app: FastifyInstance) {
                     );
                   }
                 }
-              } catch {
-                // Non-critical
+              } catch (err) {
+                logger.error(err, "[generate] Failed to apply custom tracker update");
               }
             }
 
@@ -8274,7 +8341,7 @@ export async function generateRoutes(app: FastifyInstance) {
                   let snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                   if (!snap) {
                     await gameStateStore.updateByMessage(messageId, targetSwipeIndex, input.chatId, {}, undefined, {
-                      baseSnapshot: baseGameStateSnapshot,
+                      baseSnapshot: trackerBaseGameStateSnapshot,
                     });
                     snap = await gameStateStore.getByMessage(messageId, targetSwipeIndex);
                   }
@@ -8282,11 +8349,12 @@ export async function generateRoutes(app: FastifyInstance) {
                   const questMerge = applyQuestUpdatesToPlayerStats(existingPS, updates, {
                     autoRemoveFullyCompleted: true,
                   });
+                  const questLockState = snap ? parseGameStateRow(snap as Record<string, unknown>) : null;
                   const questTrackerPatch = buildLockedPlayerStatsArrayPatch<any>({
                     field: "activeQuests",
                     values: questMerge.quests,
                     snapshot: snap,
-                    lockState: snap ? parseGameStateRow(snap as Record<string, unknown>) : null,
+                    lockState: questLockState,
                     basePlayerStats: questMerge.playerStats,
                   });
 
@@ -8295,7 +8363,10 @@ export async function generateRoutes(app: FastifyInstance) {
                     if (snap) {
                       await app.db
                         .update(gameStateSnapshotsTable)
-                        .set({ playerStats: JSON.stringify(questTrackerPatch.playerStats) })
+                        .set({
+                          playerStats: JSON.stringify(questTrackerPatch.playerStats),
+                          fieldLocks: serializeMigratedTrackerLocks(questLockState),
+                        })
                         .where(eq(gameStateSnapshotsTable.id, snap.id));
                     }
                     logger.debug("[game_state_patch] quests: %j", questTrackerPatch.values);
@@ -10602,6 +10673,9 @@ export async function generateRoutes(app: FastifyInstance) {
         }
       }
     } catch (err) {
+      if (!abortController.signal.aborted) {
+        abortController.abort();
+      }
       const message =
         err instanceof Error
           ? (err as { cause?: unknown }).cause instanceof Error

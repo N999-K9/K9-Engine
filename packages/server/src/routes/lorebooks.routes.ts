@@ -5,6 +5,7 @@ import type { FastifyInstance } from "fastify";
 import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { extname, join } from "path";
+import { logger } from "../lib/logger.js";
 import {
   createLorebookSchema,
   updateLorebookSchema,
@@ -102,7 +103,18 @@ function asStringArray(value: unknown): string[] {
 }
 
 function stSelectiveLogic(value: unknown): number {
-  return value === "or" ? 1 : value === "not" ? 2 : 0;
+  if (value === "and" || value === "or") return 0;
+  if (value === "not_all") return 1;
+  if (value === "not") return 2;
+  if (value === "and_all") return 3;
+  return 0;
+}
+
+function stPosition(value: unknown): number {
+  const position = Number(value ?? 0);
+  if (position === 2) return 4;
+  if (position === 1) return 1;
+  return 0;
 }
 
 function stRole(value: unknown): number {
@@ -135,13 +147,14 @@ function buildCompatibleLorebookExport(lb: Record<string, unknown>, entries: Arr
       key: asStringArray(entry.keys),
       keysecondary: asStringArray(entry.secondaryKeys),
       comment: String(entry.name ?? `Entry ${index + 1}`),
+      description: String(entry.description ?? ""),
       content: String(entry.content ?? ""),
       disable: entry.enabled === false,
       constant: entry.constant === true,
       selective: entry.selective === true,
       selectiveLogic: stSelectiveLogic(entry.selectiveLogic),
       order: Number(entry.order ?? 100),
-      position: Number(entry.position ?? 0),
+      position: stPosition(entry.position),
       depth: Number(entry.depth ?? 4),
       probability: entry.probability ?? null,
       scanDepth: entry.scanDepth ?? null,
@@ -153,6 +166,14 @@ function buildCompatibleLorebookExport(lb: Record<string, unknown>, entries: Arr
       sticky: entry.sticky ?? null,
       cooldown: entry.cooldown ?? null,
       delay: entry.delay ?? null,
+      ephemeral: entry.ephemeral ?? null,
+      locked: entry.locked === true,
+      useRegex: entry.useRegex === true,
+      regex: entry.useRegex === true,
+      preventRecursion: entry.preventRecursion === true,
+      excludeRecursion: entry.excludeRecursion === true,
+      delayUntilRecursion: entry.delayUntilRecursion === true,
+      vectorized: entry.excludeFromVectorization !== true,
     };
   });
 
@@ -208,6 +229,8 @@ function buildTransferredEntryInput(
     groupWeight: entry.groupWeight,
     folderId: null,
     preventRecursion: entry.preventRecursion,
+    excludeRecursion: entry.excludeRecursion,
+    delayUntilRecursion: entry.delayUntilRecursion,
     excludeFromVectorization: entry.excludeFromVectorization,
     locked: entry.locked,
     tag: entry.tag,
@@ -850,6 +873,11 @@ export async function lorebooksRoutes(app: FastifyInstance) {
       ].join(", ");
       return `${e.name ?? ""}${keys ? ` [${keys}]` : ""}\n${e.content ?? ""}`.trim();
     });
+    const existingEmbeddingDimension = body.onlyMissing
+      ? ((allEntries as Array<Record<string, unknown>>)
+          .map((entry) => entry.embedding)
+          .find((embedding): embedding is unknown[] => Array.isArray(embedding) && embedding.length > 0)?.length ?? null)
+      : null;
 
     // Batch embed (most APIs support multiple texts per call)
     const BATCH_SIZE = 50;
@@ -857,7 +885,34 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     for (let i = 0; i < texts.length; i += BATCH_SIZE) {
       const batchTexts = texts.slice(i, i + BATCH_SIZE);
       const batchEntries = entries.slice(i, i + BATCH_SIZE);
-      const embeddings = await provider.embed(batchTexts, embeddingModel);
+      let embeddings: number[][];
+      try {
+        embeddings = await provider.embed(batchTexts, embeddingModel);
+      } catch (error) {
+        logger.warn(error, "[lorebooks] Embedding batch failed");
+        return reply.status(502).send({
+          error: error instanceof Error ? error.message : "Lorebook embedding request failed",
+        });
+      }
+      const usableEmbeddingCount = embeddings.filter(
+        (embedding) => Array.isArray(embedding) && embedding.length > 0,
+      ).length;
+      if (embeddings.length !== batchTexts.length || usableEmbeddingCount !== batchTexts.length) {
+        return reply.status(502).send({
+          error: `Lorebook embedding request returned ${usableEmbeddingCount}/${batchTexts.length} usable vectors.`,
+        });
+      }
+      const batchEmbeddingDimension = embeddings.find((embedding) => embedding.length > 0)?.length ?? null;
+      if (
+        existingEmbeddingDimension &&
+        batchEmbeddingDimension &&
+        existingEmbeddingDimension !== batchEmbeddingDimension
+      ) {
+        return reply.status(409).send({
+          error:
+            "Embedding dimensions changed. Re-vectorize all entries instead of only missing entries before switching embedding models.",
+        });
+      }
       for (let j = 0; j < batchEntries.length; j++) {
         const entry = batchEntries[j] as Record<string, unknown>;
         if (embeddings[j]) {
