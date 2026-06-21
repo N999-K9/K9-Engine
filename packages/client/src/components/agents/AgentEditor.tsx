@@ -72,7 +72,6 @@ import { HelpTooltip } from "../ui/HelpTooltip";
 import {
   BUILT_IN_AGENTS,
   BUILT_IN_TOOLS,
-  createFolderEntry,
   DEFAULT_AGENT_CONTEXT_SIZE,
   DEFAULT_AGENT_TOOLS,
   DEFAULT_AGENT_MAX_TOKENS,
@@ -96,8 +95,12 @@ import {
   type CustomAgentCapabilityMap,
   type ToolDefinition,
 } from "@marinara-engine/shared";
-import { sanitizeAgentSettingsForTransfer } from "../../lib/agent-transfer";
-import { downloadJsonFile } from "../../lib/download-json";
+import {
+  createAgentFolderPackageFilename,
+  createAgentFolderPackageFiles,
+  sanitizeAgentSettingsForTransfer,
+} from "../../lib/agent-transfer";
+import { downloadZipFile } from "../../lib/download-zip";
 
 function parseActivationKeywordsText(value: string): string[] {
   const seen = new Set<string>();
@@ -1125,33 +1128,22 @@ export function AgentEditor() {
       ...(localImagePositivePrompt.trim() ? { imagePositivePrompt: localImagePositivePrompt.trim() } : {}),
       ...(localImageNegativePrompt.trim() ? { imageNegativePrompt: localImageNegativePrompt.trim() } : {}),
     });
-    const agentEntry = createFolderEntry({
-      folderName: "Agents",
-      itemName: agentType,
-      itemKind: "marinara.agent",
-      config: {
-        type: agentType,
-        name: localName,
-        description: localDescription,
-        phase: savedPhase,
-        enabled: localAgentEnabled,
-        connectionId: null,
-        imagePath: null,
-        promptTemplate: localPrompt,
-        settings,
-        ...(isEditingCustomAgent ? { resultType: localResultType } : {}),
-      },
-      fallbackName: "agent",
-    });
-    downloadJsonFile(
-      {
-        kind: "marinara.agent-folder",
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        folderName: "Agents",
-        agents: [agentEntry],
-      },
-      "marinara-agent.json",
+    downloadZipFile(
+      createAgentFolderPackageFiles([
+        {
+          type: agentType,
+          name: localName,
+          description: localDescription,
+          phase: savedPhase,
+          enabled: localAgentEnabled,
+          connectionId: null,
+          imagePath: null,
+          promptTemplate: localPrompt,
+          settings,
+          ...(isEditingCustomAgent ? { resultType: localResultType } : {}),
+        },
+      ]),
+      createAgentFolderPackageFilename(localName || agentType, "agent"),
     );
     toast.success(`Exported ${localName || "agent"}`);
   };

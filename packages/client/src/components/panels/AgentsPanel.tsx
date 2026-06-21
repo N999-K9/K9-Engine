@@ -17,6 +17,7 @@ import {
   Download,
   Check,
   FolderPlus,
+  FolderOpen,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useUIStore } from "../../stores/ui.store";
@@ -30,7 +31,6 @@ import {
 import {
   BUILT_IN_AGENTS,
   DEFAULT_AGENT_TOOLS,
-  createFolderEntry,
   getDefaultBuiltInAgentSettings,
   getFolderImportEntries,
   getFolderManifestConfig,
@@ -42,10 +42,19 @@ import {
 } from "@marinara-engine/shared";
 import { confirmNonEmptyFolderDelete, showConfirmDialog } from "../../lib/app-dialogs";
 import { cn } from "../../lib/utils";
-import { downloadJsonFile } from "../../lib/download-json";
 import { downloadZipFile } from "../../lib/download-zip";
-import { sanitizeAgentSettingsForTransfer } from "../../lib/agent-transfer";
-import { isZipFile, readTextFileFromZip } from "../../lib/read-zip-text";
+import {
+  createAgentFolderPackageFilename,
+  createAgentFolderPackageFiles,
+  sanitizeAgentSettingsForTransfer,
+  type AgentTransferConfig,
+} from "../../lib/agent-transfer";
+import {
+  collectFolderPackageEntries,
+  readTextFilesFromFileList,
+  type FolderPackageImportEntry,
+} from "../../lib/folder-package-transfer";
+import { isZipFile, readTextFilesFromZip } from "../../lib/read-zip-text";
 import { SelectionActionBar } from "../ui/SelectionActionBar";
 import {
   getNextUnnamedLibraryFolderName,
@@ -91,7 +100,7 @@ function getAgentImportEntries(parsed: unknown) {
   return getFolderImportEntries(parsed, ["agents"]);
 }
 
-function serializeAgentConfig(agent: AgentConfigRow) {
+function serializeAgentConfig(agent: AgentConfigRow): AgentTransferConfig {
   const settings = sanitizeAgentSettingsForTransfer(parseAgentSettings(agent.settings));
   if (typeof settings.author !== "string" || !settings.author.trim()) {
     settings.author = "Unknown";
@@ -109,16 +118,6 @@ function serializeAgentConfig(agent: AgentConfigRow) {
     settings,
     ...(resultType ? { resultType } : {}),
   };
-}
-
-function serializeAgentFolderEntry(agent: AgentConfigRow) {
-  return createFolderEntry({
-    folderName: "Agents",
-    itemName: agent.type,
-    itemKind: "marinara.agent",
-    config: serializeAgentConfig(agent),
-    fallbackName: "custom-agent",
-  });
 }
 
 function createBuiltInAgentConfigRow(
@@ -170,7 +169,7 @@ function createDuplicateAgentInput(agent: AgentConfigRow) {
   };
 }
 
-function normalizeAgentImportEntry(entry: unknown) {
+function normalizeAgentImportEntry(entry: unknown, resolveTextFile?: (path: unknown) => string | null) {
   const source = getFolderManifestConfig(entry);
   if (!isJsonRecord(source)) return null;
 
@@ -180,7 +179,8 @@ function normalizeAgentImportEntry(entry: unknown) {
   if (!type || !name) return null;
   const phase = normalizeAgentPhaseForType(type, normalizeAgentPhaseValue(source.phase));
 
-  const settings = sanitizeAgentSettingsForTransfer(parseAgentSettings(source.settings));
+  const settingsText = resolveTextFile?.(source.settingsPath);
+  const settings = sanitizeAgentSettingsForTransfer(parseAgentSettings(settingsText ?? source.settings));
   if (typeof source.author === "string" && !settings.author) {
     settings.author = source.author;
   }
@@ -200,7 +200,8 @@ function normalizeAgentImportEntry(entry: unknown) {
     enabled: parseBooleanValue(source.enabled),
     connectionId: null,
     imagePath: null,
-    promptTemplate: typeof source.promptTemplate === "string" ? source.promptTemplate : "",
+    promptTemplate:
+      resolveTextFile?.(source.promptTemplatePath) ?? (typeof source.promptTemplate === "string" ? source.promptTemplate : ""),
     settings,
     ...(typeof resultType === "string" ? { resultType } : {}),
   };
@@ -220,6 +221,7 @@ export function AgentsPanel() {
   const [agentSearch, setAgentSearch] = useState("");
   const agentImageInputRef = useRef<HTMLInputElement>(null);
   const agentImportInputRef = useRef<HTMLInputElement>(null);
+  const agentFolderImportInputRef = useRef<HTMLInputElement>(null);
   const imageTargetAgentIdRef = useRef<string | null>(null);
   const [agentImportError, setAgentImportError] = useState<string | null>(null);
   const [agentImportSuccess, setAgentImportSuccess] = useState<string | null>(null);
@@ -401,21 +403,13 @@ export function AgentsPanel() {
 
     setExportingSelected(true);
     try {
-      const envelope = {
-        kind: "marinara.agent-folder",
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        folderName: "Agents",
-        agents: selectedAgents.map(serializeAgentFolderEntry),
-      };
-      if (selectedAgents.length > 1) {
-        downloadZipFile(
-          [{ path: "marinara-agents.json", content: JSON.stringify(envelope, null, 2) }],
-          "marinara-agents.zip",
-        );
-      } else {
-        downloadJsonFile(envelope, "marinara-agents.json");
-      }
+      const files = createAgentFolderPackageFiles(selectedAgents.map(serializeAgentConfig));
+      const firstAgent = selectedAgents[0];
+      const filename =
+        selectedAgents.length === 1 && firstAgent
+          ? createAgentFolderPackageFilename(getAgentLibraryDisplayName(firstAgent), "agent")
+          : "marinara-agents.zip";
+      downloadZipFile(files, filename);
       toast.success(`Exported ${selectedAgents.length} agent${selectedAgents.length === 1 ? "" : "s"}`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to export agents");
@@ -472,6 +466,36 @@ export function AgentsPanel() {
     exitSelectionMode();
   }, [deleteAgent, exitSelectionMode, selectedAgents]);
 
+  const importAgentEntries = useCallback(
+    async (entries: FolderPackageImportEntry[]) => {
+      if (entries.length === 0) throw new Error("No agents found in file");
+
+      let imported = 0;
+      const failed: string[] = [];
+      for (const entry of entries) {
+        const normalized = normalizeAgentImportEntry(entry.raw, entry.resolveTextFile);
+        if (!normalized) continue;
+        try {
+          await createAgent.mutateAsync(normalized);
+          imported++;
+        } catch (error) {
+          failed.push(error instanceof Error ? error.message : `Failed to import ${normalized.name}`);
+        }
+      }
+
+      if (imported === 0 && failed.length === 0) {
+        throw new Error("No valid agents found in file");
+      }
+      if (imported > 0) {
+        setAgentImportSuccess(`Imported ${imported} agent${imported === 1 ? "" : "s"}.`);
+      }
+      if (failed.length > 0) {
+        setAgentImportError(`${failed.length} agent${failed.length === 1 ? "" : "s"} failed. ${failed[0]}`);
+      }
+    },
+    [createAgent],
+  );
+
   const handleImportAgents = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
       setAgentImportError(null);
@@ -480,40 +504,45 @@ export function AgentsPanel() {
       if (!file) return;
 
       try {
-        const text = isZipFile(file) ? await readTextFileFromZip(file, ["marinara-agents.json"]) : await file.text();
-        const parsed = JSON.parse(text);
-        const entries = getAgentImportEntries(parsed);
-        if (entries.length === 0) throw new Error("No agents found in file");
-
-        let imported = 0;
-        const failed: string[] = [];
-        for (const entry of entries) {
-          const normalized = normalizeAgentImportEntry(entry);
-          if (!normalized) continue;
-          try {
-            await createAgent.mutateAsync(normalized);
-            imported++;
-          } catch (error) {
-            failed.push(error instanceof Error ? error.message : `Failed to import ${normalized.name}`);
-          }
-        }
-
-        if (imported === 0 && failed.length === 0) {
-          throw new Error("No valid agents found in file");
-        }
-        if (imported > 0) {
-          setAgentImportSuccess(`Imported ${imported} agent${imported === 1 ? "" : "s"}.`);
-        }
-        if (failed.length > 0) {
-          setAgentImportError(`${failed.length} agent${failed.length === 1 ? "" : "s"} failed. ${failed[0]}`);
-        }
+        const entries = isZipFile(file)
+          ? collectFolderPackageEntries(await readTextFilesFromZip(file), {
+              rootFilenames: ["marinara-agents.json", "marinara-agent.json"],
+              collectionKeys: ["agents"],
+            })
+          : getAgentImportEntries(JSON.parse(await file.text())).map(
+              (raw): FolderPackageImportEntry => ({
+                raw,
+                path: file.name,
+                basePath: "",
+                resolveTextFile: () => null,
+              }),
+            );
+        await importAgentEntries(entries);
       } catch (error) {
         setAgentImportError(error instanceof Error ? error.message : "Failed to import agents");
       }
 
       event.target.value = "";
     },
-    [createAgent],
+    [importAgentEntries],
+  );
+
+  const handleImportAgentFolder = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      setAgentImportError(null);
+      setAgentImportSuccess(null);
+      try {
+        const entries = collectFolderPackageEntries(await readTextFilesFromFileList(event.target.files), {
+          rootFilenames: ["marinara-agents.json", "marinara-agent.json"],
+          collectionKeys: ["agents"],
+        });
+        await importAgentEntries(entries);
+      } catch (error) {
+        setAgentImportError(error instanceof Error ? error.message : "Failed to import agents");
+      }
+      event.target.value = "";
+    },
+    [importAgentEntries],
   );
 
   const handlePickAgentImage = useCallback((agentIdOrType: string) => {
@@ -652,6 +681,15 @@ export function AgentsPanel() {
         className="hidden"
         onChange={handleImportAgents}
       />
+      <input
+        ref={agentFolderImportInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={handleImportAgentFolder}
+        // @ts-expect-error — webkitdirectory is a non-standard but widely-supported attribute
+        webkitdirectory=""
+      />
 
       <div className="flex gap-2">
         <button onClick={handleCreateAgent} className={cn("flex-1 text-xs", AGENT_GRADIENT_BUTTON)} title="New">
@@ -663,6 +701,13 @@ export function AgentsPanel() {
           title="Import agents"
         >
           <Download size="0.8125rem" />
+        </button>
+        <button
+          onClick={() => agentFolderImportInputRef.current?.click()}
+          className="mari-chrome-control mari-chrome-control--primary flex-1 text-xs"
+          title="Import agent folder"
+        >
+          <FolderOpen size="0.8125rem" />
         </button>
         <button
           onClick={() => {

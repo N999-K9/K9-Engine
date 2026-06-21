@@ -1,4 +1,4 @@
-type ZipFileInput = {
+export type ZipFileInput = {
   path: string;
   content: string | Uint8Array;
 };

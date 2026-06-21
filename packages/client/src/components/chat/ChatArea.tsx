@@ -2154,7 +2154,6 @@ export function ChatArea() {
 
           <ChatCommonOverlays
             chat={chat}
-            activeChatId={activeChatId}
             settingsOpen={settingsOpen}
             settingsAnchor={settingsAnchor}
             filesOpen={filesOpen}

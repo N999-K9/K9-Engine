@@ -117,7 +117,21 @@ import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatD
 import { inspectCharacterFilesForEmbeddedLorebooks } from "../../lib/character-import";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { downloadJsonFile, sanitizeExportFilenamePart } from "../../lib/download-json";
+import { downloadZipFile } from "../../lib/download-zip";
+import {
+  createExtensionFolderPackageFilename,
+  createExtensionFolderPackageFiles,
+} from "../../lib/extension-transfer";
+import {
+  collectFolderPackageEntries,
+  getPackagePathBasename,
+  readTextFilesFromFileList,
+  resolvePackageTextPaths,
+  type FolderPackageImportEntry,
+  type PackageTextFile,
+} from "../../lib/folder-package-transfer";
 import { HOST_DEVICE_FILE_MANAGER_MESSAGE } from "../../lib/host-device";
+import { isZipFile as isZipArchiveFile, readTextFilesFromZip } from "../../lib/read-zip-text";
 
 type CustomFontFace = {
   filename: string;
@@ -1778,8 +1792,10 @@ function AppearanceSettings() {
   const setDefaultRoleplayBackground = useUIStore((s) => s.setDefaultRoleplayBackground);
   const chatBackgroundBlur = useUIStore((s) => s.chatBackgroundBlur);
   const setChatBackgroundBlur = useUIStore((s) => s.setChatBackgroundBlur);
+  const resetAppearanceSettings = useUIStore((s) => s.resetAppearanceSettings);
   const activeChatId = useChatStore((s) => s.activeChatId);
   const updateMeta = useUpdateChatMetadata();
+  const setActiveSyncedTheme = useSetActiveTheme();
   const handleAppBackgroundColorChange = useCallback(
     (color: string) => {
       const normalized = color.trim();
@@ -1863,6 +1879,25 @@ function AppearanceSettings() {
     setDraftFrom(currentGradient.from);
     setDraftTo(currentGradient.to);
   }, [activeGradientScheme, currentGradient.from, currentGradient.to]);
+  const handleResetAppearance = useCallback(() => {
+    resetAppearanceSettings();
+    setActiveGradientScheme("dark");
+    setDraftFrom("#0a0a0e");
+    setDraftTo("#1c2133");
+    document.getElementById("marinara-css-editor-preview")?.remove();
+    if (activeChatId) {
+      updateMeta.mutate({ id: activeChatId, background: chatBackgroundUrlToMetadata(null) });
+    }
+    void setActiveSyncedTheme
+      .mutateAsync(null)
+      .then(() => {
+        toast.success("Appearance reset to Marinara defaults.");
+      })
+      .catch((err) => {
+        console.error("[AppearanceSettings] Failed to clear active synced theme:", err);
+        toast.warning("Appearance reset locally, but the active synced theme could not be cleared.");
+      });
+  }, [activeChatId, resetAppearanceSettings, setActiveSyncedTheme, updateMeta]);
   const fontSize = useUIStore((s) => s.fontSize);
   const setFontSize = useUIStore((s) => s.setFontSize);
   const chatFontSize = useUIStore((s) => s.chatFontSize);
@@ -1992,6 +2027,22 @@ function AppearanceSettings() {
         icon={<Paintbrush size="0.875rem" />}
       >
         <div className="flex flex-col gap-3">
+          <div className="flex justify-start">
+            <button
+              type="button"
+              onClick={handleResetAppearance}
+              disabled={setActiveSyncedTheme.isPending}
+              className={SETTINGS_BUTTON_CLASS}
+              title="Reset all Appearance settings to Marinara defaults"
+            >
+              {setActiveSyncedTheme.isPending ? (
+                <Loader2 size="0.75rem" className="animate-spin" />
+              ) : (
+                <RotateCcw size="0.75rem" />
+              )}
+              Reset Appearance
+            </button>
+          </div>
           {/* ── Visual Style ── */}
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5">
@@ -3779,6 +3830,68 @@ const CSS_TEMPLATE = `/* ══════════════════�
    You can also add any custom CSS below: */
 `;
 
+function createInlineFolderPackageImportEntry(raw: unknown, path: string): FolderPackageImportEntry {
+  return {
+    raw,
+    path,
+    basePath: "",
+    resolveTextFile: () => null,
+  };
+}
+
+function normalizeExtensionImportEntry(entry: FolderPackageImportEntry, fallbackName: string) {
+  const source = getFolderManifestConfig(entry.raw);
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const record = source as Record<string, unknown>;
+  const folderName = getPackagePathBasename(entry.basePath) || fallbackName;
+  const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : folderName;
+  if (!name) return null;
+  const cssFromFiles = resolvePackageTextPaths(entry.resolveTextFile, record.cssPath ?? record.cssPaths);
+  const jsFromFiles = resolvePackageTextPaths(entry.resolveTextFile, record.jsPath ?? record.jsPaths);
+
+  return {
+    name,
+    description: typeof record.description === "string" ? record.description : "",
+    css: cssFromFiles ?? (typeof record.css === "string" ? record.css : null),
+    js: jsFromFiles ?? (typeof record.js === "string" ? record.js : null),
+    enabled: typeof record.enabled === "boolean" ? record.enabled : true,
+  };
+}
+
+function createLooseExtensionFolderImportEntries(
+  files: PackageTextFile[],
+  fallbackName: string,
+): FolderPackageImportEntry[] {
+  const css = files
+    .filter((file) => file.path.toLowerCase().endsWith(".css"))
+    .map((file) => file.text)
+    .join("\n\n");
+  const js = files
+    .filter((file) => /\.(js|mjs|cjs)$/i.test(file.path))
+    .map((file) => file.text)
+    .join("\n\n");
+  if (!css && !js) return [];
+  return [
+    createInlineFolderPackageImportEntry(
+      {
+        name: fallbackName || "extension",
+        description: "Extension imported from folder",
+        css: css || null,
+        js: js || null,
+        enabled: true,
+      },
+      fallbackName || "extension",
+    ),
+  ];
+}
+
+function getLooseExtensionFolderName(files: PackageTextFile[], fallbackName: string) {
+  const firstPath = files[0]?.path;
+  if (!firstPath) return fallbackName;
+  const firstSlash = firstPath.indexOf("/");
+  return firstSlash > 0 ? firstPath.slice(0, firstSlash) : fallbackName;
+}
+
 function ExtensionsSettings() {
   const { data: extensions, isLoading } = useExtensions();
   const extensionList = extensions ?? [];
@@ -3786,52 +3899,70 @@ function ExtensionsSettings() {
   const updateExtension = useUpdateExtension();
   const deleteExtension = useDeleteExtension();
   const fileRef = useRef<HTMLInputElement>(null);
+  const folderRef = useRef<HTMLInputElement>(null);
+
+  const importExtensionEntries = async (
+    entries: FolderPackageImportEntry[],
+    installedAt: string,
+    fallbackName: string,
+  ) => {
+    let imported = 0;
+    let failed = 0;
+    for (const entry of entries) {
+      const normalized = normalizeExtensionImportEntry(entry, fallbackName);
+      if (!normalized) continue;
+      try {
+        await createExtension.mutateAsync({
+          ...normalized,
+          installedAt,
+        });
+        imported++;
+      } catch (err) {
+        failed++;
+        console.warn("[ExtensionsSettings] Failed to import extension entry:", normalized.name, err);
+      }
+    }
+    if (imported === 0 && failed === 0) throw new Error("No valid extensions found in file");
+    if (failed > 0) {
+      toast.warning(
+        imported > 0
+          ? `Installed ${imported} extension${imported === 1 ? "" : "s"} (${failed} failed).`
+          : `Failed to install ${failed} extension${failed === 1 ? "" : "s"}.`,
+      );
+    } else {
+      toast.success(`Installed ${imported} extension${imported === 1 ? "" : "s"}`);
+    }
+  };
 
   const handleImportExtension = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const text = await file.text();
       const installedAt = new Date().toISOString();
+      const fallbackName = file.name.replace(/\.(json|css|js|zip)$/i, "");
+      const lowerName = file.name.toLowerCase();
 
-      if (file.name.endsWith(".json")) {
+      if (isZipArchiveFile(file)) {
+        const files = await readTextFilesFromZip(file);
+        const entries = collectFolderPackageEntries(files, {
+          rootFilenames: ["marinara-extensions.json", "marinara-extension.json"],
+          collectionKeys: ["extensions"],
+        });
+        await importExtensionEntries(
+          entries.length > 0 ? entries : createLooseExtensionFolderImportEntries(files, fallbackName),
+          installedAt,
+          fallbackName,
+        );
+      } else if (lowerName.endsWith(".json")) {
+        const text = await file.text();
         const parsed = JSON.parse(text);
-        const entries = getFolderImportEntries(parsed, ["extensions"]);
-        let imported = 0;
-        let failed = 0;
-        for (const entry of entries) {
-          const source = getFolderManifestConfig(entry);
-          if (!source || typeof source !== "object" || Array.isArray(source)) continue;
-          const record = source as Record<string, unknown>;
-          const name =
-            typeof record.name === "string" && record.name.trim() ? record.name : file.name.replace(/\.json$/, "");
-          try {
-            await createExtension.mutateAsync({
-              name,
-              description: typeof record.description === "string" ? record.description : "",
-              css: typeof record.css === "string" ? record.css : null,
-              js: typeof record.js === "string" ? record.js : null,
-              enabled: typeof record.enabled === "boolean" ? record.enabled : true,
-              installedAt,
-            });
-            imported++;
-          } catch (err) {
-            failed++;
-            console.warn("[ExtensionsSettings] Failed to import extension entry:", name, err);
-          }
-        }
-        if (imported === 0 && failed === 0) throw new Error("No valid extensions found in file");
-        if (failed > 0) {
-          toast.warning(
-            imported > 0
-              ? `Installed ${imported} extension${imported === 1 ? "" : "s"} (${failed} failed).`
-              : `Failed to install ${failed} extension${failed === 1 ? "" : "s"}.`,
-          );
-        } else {
-          toast.success(`Installed ${imported} extension${imported === 1 ? "" : "s"}`);
-        }
-      } else if (file.name.endsWith(".js")) {
-        const name = file.name.replace(/\.js$/, "");
+        const entries = getFolderImportEntries(parsed, ["extensions"]).map((entry) =>
+          createInlineFolderPackageImportEntry(entry, file.name),
+        );
+        await importExtensionEntries(entries, installedAt, fallbackName);
+      } else if (lowerName.endsWith(".js")) {
+        const text = await file.text();
+        const name = file.name.replace(/\.js$/i, "");
         await createExtension.mutateAsync({
           name,
           description: "JS extension imported from file",
@@ -3840,8 +3971,9 @@ function ExtensionsSettings() {
           installedAt,
         });
         toast.success(`Extension "${name}" installed`);
-      } else if (file.name.endsWith(".css")) {
-        const name = file.name.replace(/\.css$/, "");
+      } else if (lowerName.endsWith(".css")) {
+        const text = await file.text();
+        const name = file.name.replace(/\.css$/i, "");
         await createExtension.mutateAsync({
           name,
           description: "CSS extension imported from file",
@@ -3851,10 +3983,30 @@ function ExtensionsSettings() {
         });
         toast.success(`Extension "${name}" installed`);
       } else {
-        toast.error("Only .json, .css, and .js extension files are supported.");
+        toast.error("Only .zip, .json, .css, and .js extension files are supported.");
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to import extension.");
+    }
+    e.target.value = "";
+  };
+
+  const handleImportExtensionFolder = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    try {
+      const installedAt = new Date().toISOString();
+      const files = await readTextFilesFromFileList(e.target.files);
+      const folderName = getLooseExtensionFolderName(files, "extension");
+      const entries = collectFolderPackageEntries(files, {
+        rootFilenames: ["marinara-extensions.json", "marinara-extension.json"],
+        collectionKeys: ["extensions"],
+      });
+      await importExtensionEntries(
+        entries.length > 0 ? entries : createLooseExtensionFolderImportEntries(files, folderName),
+        installedAt,
+        folderName,
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to import extension folder.");
     }
     e.target.value = "";
   };
@@ -3874,14 +4026,29 @@ function ExtensionsSettings() {
             onClick={() => fileRef.current?.click()}
             className="flex items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--border)] p-3 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
           >
-            <Download size="0.875rem" /> Import Extension (.json, .css, or .js)
+            <Download size="0.875rem" /> Import Extension File (.zip, .json, .css, or .js)
+          </button>
+          <button
+            onClick={() => folderRef.current?.click()}
+            className="flex items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-[var(--border)] p-3 text-xs text-[var(--muted-foreground)] transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--secondary)]/50"
+          >
+            <FolderOpen size="0.875rem" /> Import Extension Folder
           </button>
           <input
             ref={fileRef}
             type="file"
-            accept=".json,.css,.js"
+            accept=".zip,.json,.css,.js,application/zip,application/json"
             className="hidden"
             onChange={handleImportExtension}
+          />
+          <input
+            ref={folderRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleImportExtensionFolder}
+            // @ts-expect-error — webkitdirectory is a non-standard but widely-supported attribute
+            webkitdirectory=""
           />
 
           {/* Extension list */}
@@ -3918,29 +4085,17 @@ function ExtensionsSettings() {
                 </div>
                 <button
                   onClick={() => {
-                    downloadJsonFile(
-                      {
-                        kind: "marinara.extension-folder",
-                        version: 1,
-                        exportedAt: new Date().toISOString(),
-                        folderName: "Extensions",
-                        extensions: [
-                          createFolderEntry({
-                            folderName: "Extensions",
-                            itemName: ext.name,
-                            itemKind: "marinara.extension",
-                            config: {
-                              name: ext.name,
-                              description: ext.description ?? "",
-                              css: ext.css ?? null,
-                              js: ext.js ?? null,
-                              enabled: ext.enabled,
-                            },
-                            fallbackName: "extension",
-                          }),
-                        ],
-                      },
-                      `${sanitizeExportFilenamePart(ext.name, "extension")}.json`,
+                    downloadZipFile(
+                      createExtensionFolderPackageFiles([
+                        {
+                          name: ext.name,
+                          description: ext.description ?? "",
+                          css: ext.css ?? null,
+                          js: ext.js ?? null,
+                          enabled: ext.enabled,
+                        },
+                      ]),
+                      createExtensionFolderPackageFilename(ext.name, "extension"),
                     );
                   }}
                   className="rounded p-0.5 text-[var(--muted-foreground)] transition-colors hover:bg-emerald-500/10 hover:text-emerald-400"
@@ -3960,16 +4115,16 @@ function ExtensionsSettings() {
 
             {!isLoading && extensionList.length === 0 && (
               <p className="py-2 text-center text-[0.625rem] text-[var(--muted-foreground)]">
-                No extensions installed. Import a .json, .css, or .js extension file above.
+                No extensions installed. Import an extension file or folder above.
               </p>
             )}
           </div>
 
           {/* Info box */}
           <div className="rounded-lg bg-[var(--secondary)]/50 p-2.5 text-[0.625rem] text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
-            <strong>JSON format:</strong>{" "}
-            <code className="rounded bg-[var(--secondary)] px-1">{`{ "name": "...", "description": "...", "css": "..." }`}</code>
-            . Extensions can inject custom CSS and/or JavaScript to modify the UI.
+            <strong>Folder format:</strong>{" "}
+            <code className="rounded bg-[var(--secondary)] px-1">Extensions/My Extension/manifest.json</code>
+            . Extensions can include CSS and/or JavaScript files to modify the UI.
           </div>
           <div className="rounded-lg bg-[var(--secondary)]/35 p-2.5 text-[0.625rem] leading-relaxed text-[var(--muted-foreground)] ring-1 ring-[var(--border)]">
             Extensions can be downloaded from the official Marinara Engine Discord server.

@@ -396,7 +396,7 @@ export function ChatBranchSelector({
                           type="button"
                           onClick={() => void handleDeleteBranch(branch.id)}
                           disabled={deleteChat.isPending}
-                          className="rounded-lg p-1.5 text-[var(--destructive)] transition-colors hover:bg-[var(--destructive)]/15 disabled:opacity-50"
+                          className="rounded-lg p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)] disabled:opacity-50"
                           title="Delete branch"
                         >
                           <Trash2 size="0.75rem" />
@@ -427,7 +427,7 @@ export function ChatBranchSelector({
                     setOpen(false);
                   }}
                   disabled={deleteChatGroup.isPending}
-                  className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-3 py-2 text-[0.6875rem] font-medium text-[var(--destructive)] ring-1 ring-[var(--destructive)]/20 transition-colors hover:bg-[var(--destructive)]/20 disabled:opacity-50"
+                  className="mari-chrome-control mari-chrome-control--primary w-full px-3 py-2 text-[0.6875rem] disabled:opacity-50"
                 >
                   <Trash2 size="0.75rem" />
                   Delete All Branches

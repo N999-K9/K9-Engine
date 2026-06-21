@@ -52,6 +52,7 @@ import {
 import { TranscriptWindowControls } from "./TranscriptWindowControls";
 import { EndSceneBar } from "./SceneBanner";
 import { ChatCommonOverlays } from "./ChatCommonOverlays";
+import { PinnedImageOverlay } from "./PinnedImageOverlay";
 import {
   ROLEPLAY_POPOVER_SCROLL_AREA,
   ROLEPLAY_POPOVER_SHELL,
@@ -1551,6 +1552,7 @@ export function ChatRoleplaySurface({
                 <div ref={messagesEndRef} />
               </div>
             </div>
+            <PinnedImageOverlay activeChatId={activeChatId} />
 
             <div
               ref={inputChromeRef}
@@ -1609,7 +1611,6 @@ export function ChatRoleplaySurface({
 
       <ChatCommonOverlays
         chat={chat}
-        activeChatId={activeChatId}
         settingsOpen={settingsOpen}
         settingsAnchor={settingsAnchor}
         settingsInitialSection={settingsInitialSection}

@@ -186,7 +186,6 @@ export function ChatConversationSurface({
 
       <ChatCommonOverlays
         chat={chat}
-        activeChatId={activeChatId}
         settingsOpen={settingsOpen}
         settingsAnchor={settingsAnchor}
         settingsInitialSection={settingsInitialSection}

@@ -756,6 +756,7 @@ interface UIState {
   requestChatModeShortcut: (mode: ChatModeShortcut) => void;
   setVisualTheme: (v: VisualTheme) => void;
   setConvoGradientField: (scheme: "dark" | "light", field: "from" | "to", value: string) => void;
+  resetAppearanceSettings: () => void;
   setConvoNotificationSound: (v: boolean) => void;
   setRpNotificationSound: (v: boolean) => void;
   setGameNotificationSound: (v: boolean) => void;
@@ -1632,6 +1633,53 @@ export const useUIStore = create<UIState>()(
             [scheme]: { ...s.convoGradient[scheme], [field]: value },
           },
         })),
+      resetAppearanceSettings: () =>
+        set({
+          trackerPanelEnabled: true,
+          trackerPanelOpen: false,
+          trackerPanelSide: "right" as TrackerPanelSide,
+          trackerPanelHideHudWidgets: false,
+          trackerPanelUseExpressionSprites: false,
+          trackerPanelThoughtBubbleDisplay: "inline" as TrackerThoughtBubbleDisplay,
+          trackerPanelDockedThoughtsAlwaysVisible: false,
+          trackerPanelSizeProfile: "standard" as TrackerPanelSizeProfile,
+          trackerPanelBackgroundColor: TRACKER_PANEL_DEFAULT_BACKGROUND_COLOR,
+          trackerTemperatureUnit: "celsius" as TrackerTemperatureUnit,
+          trackerPanelCollapsedSections: {},
+          trackerPanelSectionOrder: [...TRACKER_DATA_PANEL_SECTIONS],
+          theme: "dark" as const,
+          appBackgroundColor: "",
+          appAccentColor: "",
+          appAccentRgbMode: false,
+          chatBackground: null,
+          defaultRoleplayBackground: DEFAULT_ROLEPLAY_BACKGROUND_URL,
+          chatBackgroundBlur: 0,
+          fontSize: 17 as FontSize,
+          chatFontSize: 16,
+          fontFamily: "",
+          conversationMessageStyle: "classic" as ConversationMessageStyle,
+          narrationFontColor: "",
+          narrationOpacity: 80,
+          chatFontColor: "",
+          chatChromeTextColor: "",
+          chatFontOpacity: 90,
+          roleplayAvatarStyle: "circles" as RoleplayAvatarStyle,
+          roleplayAvatarScale: 1,
+          roleplayAvatarsScrollable: false,
+          roleplaySpriteScale: 1,
+          gameDialogueDisplayMode: "classic" as GameDialogueDisplayMode,
+          gameAvatarScale: 1,
+          gameFullBodySpriteScale: 1.35,
+          textStrokeWidth: 0.5,
+          textStrokeColor: "#000000",
+          visualTheme: "default" as VisualTheme,
+          convoGradient: {
+            dark: { from: "#0a0a0e", to: "#1c2133" },
+            light: { from: "#f2eff7", to: "#eae6f0" },
+          },
+          weatherEffects: true,
+          hudPosition: "top" as HudPosition,
+        }),
       setConvoNotificationSound: (v) => set({ convoNotificationSound: v }),
       setRpNotificationSound: (v) => set({ rpNotificationSound: v }),
       setGameNotificationSound: (v) => set({ gameNotificationSound: v }),

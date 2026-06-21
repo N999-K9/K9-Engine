@@ -1,7 +1,6 @@
 import { Suspense, lazy, type ComponentProps } from "react";
 import type { SpriteSide } from "@marinara-engine/shared";
 import { ChevronUp, ChevronDown, Trash2 } from "lucide-react";
-import { PinnedImageOverlay } from "./PinnedImageOverlay";
 import type { PeekPromptData } from "./chat-area.types";
 
 const ChatSettingsDrawer = lazy(async () => {
@@ -179,7 +178,6 @@ function MultiSelectBar({
 
 type ChatCommonOverlaysProps = {
   chat: ChatData | null | undefined;
-  activeChatId: string;
   settingsOpen: boolean;
   settingsAnchor: ChatFloatingPanelAnchor;
   settingsInitialSection?: ChatSettingsInitialSection;
@@ -215,7 +213,6 @@ type ChatCommonOverlaysProps = {
 
 export function ChatCommonOverlays({
   chat,
-  activeChatId,
   settingsOpen,
   settingsAnchor,
   settingsInitialSection,
@@ -287,7 +284,6 @@ export function ChatCommonOverlays({
       {chat && (
         <Suspense fallback={null}>{wizardOpen && <ChatSetupWizard chat={chat} onFinish={onWizardFinish} />}</Suspense>
       )}
-      <PinnedImageOverlay activeChatId={activeChatId} />
       <Suspense fallback={null}>
         {peekPromptData && <PeekPromptModal data={peekPromptData} onClose={onClosePeekPrompt} />}
       </Suspense>

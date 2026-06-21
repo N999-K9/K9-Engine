@@ -24,6 +24,7 @@ import { ActiveLorebookEntriesButton } from "./ActiveLorebookEntriesButton";
 import { ChatToolbarButton, ChatToolbarMenu } from "./ChatToolbarControls";
 import { ConversationPresenceCard } from "./ConversationPresenceCard";
 import { TranscriptWindowControls } from "./TranscriptWindowControls";
+import { PinnedImageOverlay } from "./PinnedImageOverlay";
 import { useChatStore } from "../../stores/chat.store";
 import { useUnoGameStore } from "../../stores/uno-game.store";
 import { useUIStore } from "../../stores/ui.store";
@@ -852,7 +853,7 @@ export function ConversationView({
       {/* ── Messages scroll area ── */}
       <div ref={scrollRef} className="mari-messages-scroll flex-1 overflow-y-auto overflow-x-hidden">
         {/* Floating header — character info + action buttons */}
-        <div className="sticky top-0 z-10 flex items-center justify-between px-4 py-2">
+        <div className="sticky top-0 z-30 flex items-center justify-between px-4 py-2">
           <ConversationPresenceCard
             chatId={chatId}
             chatMeta={chatMeta}
@@ -1105,6 +1106,7 @@ export function ConversationView({
 
         <div ref={messagesEndRef} className="h-1" />
       </div>
+      <PinnedImageOverlay activeChatId={chatId} />
 
       {/* ── Autonomous message toast notification ── */}
       {hasAutonomousMessaging && (

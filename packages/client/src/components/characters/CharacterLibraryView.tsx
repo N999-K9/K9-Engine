@@ -18,11 +18,11 @@ import { useUIStore, type CharacterLibrarySort } from "../../stores/ui.store";
 import type { CharacterData } from "@marinara-engine/shared";
 
 const libraryToolbarButtonClass =
-  "mari-chrome-control h-10 min-w-0 px-3 text-[0.75rem] md:h-9";
+  "mari-chrome-control mari-chrome-control--primary h-10 min-h-10 min-w-0 px-3 text-[0.75rem]";
 const libraryToolbarFieldClass =
   "mari-chrome-field h-10 w-full text-[0.75rem] md:h-9";
 const libraryNewCharacterButtonClass =
-  "mari-chrome-control mari-chrome-control--primary h-10 min-w-0 px-3 text-[0.75rem] md:h-9";
+  "mari-panel-gradient-button mari-panel-gradient--characters h-10 min-h-10 min-w-0 px-3 text-[0.75rem]";
 
 type CharacterRow = {
   id: string;

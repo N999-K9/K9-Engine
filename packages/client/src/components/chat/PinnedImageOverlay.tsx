@@ -189,7 +189,7 @@ function PinnedImageViewer({
 
   return (
     <div
-      className="group fixed z-[110] cursor-grab select-none touch-none active:cursor-grabbing"
+      className="group fixed z-[20] cursor-grab select-none touch-none active:cursor-grabbing"
       style={{ left: pos.x, top: pos.y, width: size.w, height: size.h }}
       onPointerDown={onDragStart}
       onPointerMove={onDragMove}

@@ -319,10 +319,10 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
                           void handleDelete(cf.id);
                         }}
                         disabled={deleteChat.isPending}
-                        className="rounded-lg p-1.5 transition-all hover:bg-[var(--destructive)]/15"
+                        className="rounded-lg p-1.5 text-[var(--muted-foreground)] ring-1 ring-transparent transition-all hover:bg-[var(--accent)]/80 hover:text-[var(--foreground)] hover:ring-[var(--border)] active:scale-[0.95] disabled:opacity-50"
                         title="Delete branch"
                       >
-                        <Trash2 size="0.75rem" className="text-[var(--destructive)]" />
+                        <Trash2 size="0.75rem" />
                       </button>
                     </div>
                   )}
@@ -351,7 +351,7 @@ export function ChatFilesDrawer({ chat, open, onClose }: ChatFilesDrawerProps) {
               onClose();
             }}
             disabled={deleteChatGroup.isPending}
-            className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-[var(--destructive)]/10 px-3 py-2 text-xs font-medium text-[var(--destructive)] ring-1 ring-[var(--destructive)]/20 transition-all hover:bg-[var(--destructive)]/20 active:scale-[0.98] disabled:opacity-50"
+            className="mari-chrome-control mari-chrome-control--primary w-full px-3 py-2 text-xs disabled:opacity-50"
           >
             <Trash2 size="0.8125rem" />
             Delete All Branches
