@@ -123,6 +123,7 @@ export function TopBar() {
   const isTopbarHovered = (key: string) => hoveredTopbarKey === key;
 
   const handleTopbarPointerOver = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType !== "mouse") return;
     if (!(event.target instanceof Element)) return;
     const button = event.target.closest("[data-topbar-hover-key]");
     if (!(button instanceof HTMLElement) || !event.currentTarget.contains(button)) return;

@@ -1762,7 +1762,7 @@ body {
 .mari-home-starfield__star::before {
   inset: 0;
   background:
-    radial-gradient(circle, var(--foreground) 0 12%, currentColor 28%, transparent 72%),
+    radial-gradient(circle, var(--foreground) 0 12%, currentcolor 28%, transparent 72%),
     radial-gradient(circle, var(--mari-home-star-halo) 0 42%, transparent 74%);
 }
 
