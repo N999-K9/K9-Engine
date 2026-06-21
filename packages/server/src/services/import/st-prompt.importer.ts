@@ -27,10 +27,76 @@ function normalizeTopP(v: number | null | undefined) {
   return clamped <= 0 ? 1 : clamped;
 }
 function toReasoningEffort(v: unknown): "low" | "medium" | "high" | "xhigh" | "maximum" | null {
+  if (typeof v === "string" && v === "min") return "low";
+  if (typeof v === "string" && v === "max") return "maximum";
   if (typeof v === "string" && v === "auto") return "maximum";
   if (typeof v === "string" && VALID_REASONING.has(v))
     return v as "low" | "medium" | "high" | "xhigh" | "maximum";
   return null;
+}
+
+function toVerbosity(v: unknown): "low" | "medium" | "high" | null {
+  return v === "low" || v === "medium" || v === "high" ? v : null;
+}
+
+function parseStringArray(raw: unknown, parseJsonString: boolean): string[] {
+  if (Array.isArray(raw)) return raw.filter((item): item is string => typeof item === "string" && item.length > 0);
+  if (typeof raw !== "string") return [];
+  if (!parseJsonString) return raw ? [raw] : [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string" && item.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeStopSequences(preset: STPreset): string[] {
+  const seen = new Set<string>();
+  const stops = [
+    ...parseStringArray(preset.custom_stopping_strings, true),
+    ...parseStringArray(preset.stop, false),
+  ];
+  return stops.filter((stop) => {
+    if (seen.has(stop)) return false;
+    seen.add(stop);
+    return true;
+  });
+}
+
+function parseScalar(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed.replace(/^(['"])(.*)\1$/, "$2");
+  }
+}
+
+function parseCustomParameters(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (typeof raw !== "string" || !raw.trim()) return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    const out: Record<string, unknown> = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const separator = trimmed.indexOf(":");
+      if (separator <= 0) continue;
+      const key = trimmed.slice(0, separator).trim();
+      if (!key) continue;
+      out[key] = parseScalar(trimmed.slice(separator + 1));
+    }
+    return out;
+  }
 }
 
 interface STPromptEntry {
@@ -100,14 +166,14 @@ export async function importSTPreset(
         frequencyPenalty: clamp(preset.frequency_penalty ?? 0, -2, 2),
         presencePenalty: clamp(preset.presence_penalty ?? 0, -2, 2),
         reasoningEffort: toReasoningEffort(preset.reasoning_effort),
-        verbosity: null,
+        verbosity: toVerbosity(preset.verbosity ?? preset.verbosity_level ?? preset.verbosity_levels),
         serviceTier: null,
-        assistantPrefill: "",
-        customParameters: {},
+        assistantPrefill: typeof preset.assistant_prefill === "string" ? preset.assistant_prefill : "",
+        customParameters: parseCustomParameters(preset.custom_include_body),
         squashSystemMessages: preset.squash_system_messages ?? true,
         showThoughts: preset.show_thoughts ?? true,
         useMaxContext: false,
-        stopSequences: [],
+        stopSequences: normalizeStopSequences(preset),
         strictRoleFormatting: true,
         singleUserMessage: false,
       },
