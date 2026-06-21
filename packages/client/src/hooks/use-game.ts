@@ -382,6 +382,12 @@ export function useRegenerateSessionLorebook() {
     },
     onError: (err, variables) => {
       console.error("[game/session/regenerate-lorebook] Error:", err);
+      if (isJsonRepairApiError(err)) {
+        toast.info("Review the generated lorebook JSON before applying it.", {
+          id: `game-session-lorebook:${variables.chatId}:${variables.sessionNumber}`,
+        });
+        return;
+      }
       toast.error(err.message || "Failed to regenerate session lorebook.", {
         id: `game-session-lorebook:${variables.chatId}:${variables.sessionNumber}`,
       });

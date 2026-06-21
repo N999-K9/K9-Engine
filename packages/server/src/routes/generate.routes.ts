@@ -197,6 +197,7 @@ import {
   isMessageHiddenFromAI,
   mergeCustomParameters,
   parseExtra,
+  parseJsonField,
   parseStoredGenerationParameters,
   parseGameStateRow,
   parseSnapshotPlayerStats,
@@ -7825,21 +7826,9 @@ export async function generateRoutes(app: FastifyInstance) {
                 // these fields from the previous snapshot — the dedicated tracker agents
                 // (character-tracker, persona-stats, quest, custom-tracker) will update
                 // them with authoritative data in their own handler blocks below.
-                const snapshotChars = prevSnap?.presentCharacters
-                  ? typeof prevSnap.presentCharacters === "string"
-                    ? JSON.parse(prevSnap.presentCharacters)
-                    : prevSnap.presentCharacters
-                  : [];
-                const snapshotPersonaStats = prevSnap?.personaStats
-                  ? typeof prevSnap.personaStats === "string"
-                    ? JSON.parse(prevSnap.personaStats)
-                    : prevSnap.personaStats
-                  : null;
-                const snapshotPlayerStats = prevSnap?.playerStats
-                  ? typeof prevSnap.playerStats === "string"
-                    ? JSON.parse(prevSnap.playerStats)
-                    : prevSnap.playerStats
-                  : null;
+                const snapshotChars = parseJsonField<any[]>(prevSnap?.presentCharacters, []);
+                const snapshotPersonaStats = parseJsonField<any[] | null>(prevSnap?.personaStats, null);
+                const snapshotPlayerStats = parseJsonField<Record<string, unknown> | null>(prevSnap?.playerStats, null);
                 const currentGameStateForLocks = prevSnap
                   ? parseGameStateRow(prevSnap as Record<string, unknown>)
                   : null;
@@ -7945,11 +7934,7 @@ export async function generateRoutes(app: FastifyInstance) {
                   snapBeforeUpdate ??
                   baseGameStateSnapshot ??
                   (allowLatestGameStateFallback ? await gameStateStore.getLatest(input.chatId) : null);
-                const oldChars: any[] = previousCharacterSnapshot?.presentCharacters
-                  ? typeof previousCharacterSnapshot.presentCharacters === "string"
-                    ? JSON.parse(previousCharacterSnapshot.presentCharacters)
-                    : previousCharacterSnapshot.presentCharacters
-                  : [];
+                const oldChars = parseJsonField<any[]>(previousCharacterSnapshot?.presentCharacters, []);
                 preserveTrackerCharacterUiFields(chars, oldChars);
                 const characterLockState = previousCharacterSnapshot
                   ? parseGameStateRow(previousCharacterSnapshot as Record<string, unknown>)

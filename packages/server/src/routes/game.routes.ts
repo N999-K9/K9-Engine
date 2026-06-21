@@ -1976,7 +1976,7 @@ type GameLorebookKeeperBook = {
 
 type GameLorebookKeeperRunResult =
   | { status: "success"; lorebookId: string; entryCount: number }
-  | { status: "failed"; lorebookId: string | null; error: string }
+  | { status: "failed"; lorebookId: string | null; error: string; rawJson?: string }
   | { status: "skipped"; reason: string };
 
 function parseChatCharacterIds(value: unknown): string[] {
@@ -2462,7 +2462,23 @@ async function runGameLorebookKeeperAfterConclusion(args: {
       "Game lorebook keeper",
     );
     const extraction = extractLeadingThinkingBlocks(result.content ?? "", generationParameters?.customThinkingTags);
-    const parsed = parseJSON(extraction.content) as Record<string, unknown>;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseJSON(extraction.content) as Record<string, unknown>;
+    } catch (err) {
+      const error = formatGameLorebookKeeperError(err);
+      await chats.patchMetadata(args.chatId, {
+        gameLorebookKeeperLastRun: {
+          sessionNumber: args.sessionNumber,
+          status: "failed",
+          updatedAt: new Date().toISOString(),
+          lorebookId: lorebook.id,
+          error,
+        },
+      });
+      logger.warn(err, "[game/lorebook-keeper] Generated lorebook JSON failed to parse for chat %s", args.chatId);
+      return { status: "failed", lorebookId: lorebook.id, error, rawJson: extraction.content };
+    }
     const entries = normalizeGameLorebookKeeperEntries(parsed);
     const createdCount = await createGameLorebookKeeperEntries({
       lorebooksStore,
@@ -2514,7 +2530,7 @@ function queueGameLorebookKeeperAfterConclusion(
   });
 }
 
-type JsonRepairKind = "game_setup" | "session_conclusion" | "campaign_progression";
+type JsonRepairKind = "game_setup" | "session_conclusion" | "campaign_progression" | "lorebook_keeper";
 
 type JsonRepairPayload = {
   kind: JsonRepairKind;
@@ -4698,7 +4714,7 @@ export async function gameRoutes(app: FastifyInstance) {
   });
 
   // ── POST /game/session/regenerate-lorebook ──
-  app.post("/session/regenerate-lorebook", async (req) => {
+  app.post("/session/regenerate-lorebook", async (req, reply) => {
     const {
       chatId,
       connectionId,
@@ -4731,6 +4747,20 @@ export async function gameRoutes(app: FastifyInstance) {
     });
 
     if (result.status === "failed") {
+      if (result.rawJson) {
+        sendJsonRepairError(
+          reply,
+          result.error || "Game Lorebook Keeper returned invalid JSON.",
+          buildJsonRepairPayload({
+            kind: "lorebook_keeper",
+            title: `Repair Session ${sessionNumber} Lorebook JSON`,
+            rawJson: result.rawJson,
+            applyEndpoint: "/game/session/lorebook-keeper/apply-json",
+            applyBody: { chatId, connectionId, sessionNumber },
+          }),
+        );
+        return;
+      }
       throw new Error(result.error || "Game Lorebook Keeper failed");
     }
     if (result.status === "skipped") {
@@ -4742,6 +4772,72 @@ export async function gameRoutes(app: FastifyInstance) {
       lorebookId: result.lorebookId,
       entryCount: result.entryCount,
     };
+  });
+
+  // ── POST /game/session/lorebook-keeper/apply-json ──
+  app.post("/session/lorebook-keeper/apply-json", async (req, reply) => {
+    const { chatId, rawJson, sessionNumber } = jsonRepairApplySchema.parse(req.body);
+    const chats = createChatsStorage(app.db);
+    const chat = await chats.getById(chatId);
+    if (!chat) throw new Error("Chat not found");
+    if ((chat.mode as string) !== "game") throw new Error("Lorebook Keeper repair is only available in game mode");
+
+    const meta = parseMeta(chat.metadata);
+    if (meta.gameLorebookKeeperEnabled !== true) {
+      throw new Error("Game Lorebook Keeper is not enabled for this game");
+    }
+    if (!sessionNumber) throw new Error("Session number is required for Lorebook Keeper repair");
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseJSON(rawJson) as Record<string, unknown>;
+    } catch (err) {
+      logger.warn(err, "[game/lorebook-keeper/apply-json] Repaired lorebook JSON still failed to parse");
+      sendJsonRepairError(
+        reply,
+        "The edited Lorebook Keeper JSON is still invalid.",
+        buildJsonRepairPayload({
+          kind: "lorebook_keeper",
+          title: `Repair Session ${sessionNumber} Lorebook JSON`,
+          rawJson,
+          applyEndpoint: "/game/session/lorebook-keeper/apply-json",
+          applyBody: { chatId, sessionNumber },
+        }),
+      );
+      return;
+    }
+
+    const entries = normalizeGameLorebookKeeperEntries(parsed);
+    const lorebooksStore = createLorebooksStorage(app.db);
+    const lorebook = await resolveGameLorebookKeeperBook({ lorebooksStore, chat, meta });
+    if (!lorebook?.id) throw new Error("Could not resolve target lorebook.");
+
+    const createdCount = await createGameLorebookKeeperEntries({
+      lorebooksStore,
+      lorebookId: lorebook.id,
+      sessionNumber,
+      entries,
+      replaceExistingSessionEntries: true,
+    });
+
+    await chats.patchMetadata(chatId, (current) => {
+      const activeLorebookIds = Array.isArray(current.activeLorebookIds)
+        ? current.activeLorebookIds.filter((id): id is string => typeof id === "string")
+        : [];
+      return {
+        gameLorebookKeeperLorebookId: lorebook.id,
+        activeLorebookIds: Array.from(new Set([...activeLorebookIds, lorebook.id])),
+        gameLorebookKeeperLastRun: {
+          sessionNumber,
+          status: "success",
+          updatedAt: new Date().toISOString(),
+          lorebookId: lorebook.id,
+          entryCount: createdCount,
+        },
+      };
+    });
+
+    return { sessionNumber, lorebookId: lorebook.id, entryCount: createdCount };
   });
 
   // ── POST /game/session/regenerate-conclusion ──

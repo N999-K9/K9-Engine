@@ -25,7 +25,7 @@ export class ApiError extends Error {
   }
 }
 
-export type JsonRepairKind = "game_setup" | "session_conclusion" | "campaign_progression";
+export type JsonRepairKind = "game_setup" | "session_conclusion" | "campaign_progression" | "lorebook_keeper";
 
 export type JsonRepairRequest = {
   kind: JsonRepairKind;
@@ -49,7 +49,10 @@ export function getJsonRepairRequest(error: unknown): JsonRepairRequest | null {
   const rawJson = repair.rawJson;
   const applyEndpoint = repair.applyEndpoint;
   if (
-    (kind !== "game_setup" && kind !== "session_conclusion" && kind !== "campaign_progression") ||
+    (kind !== "game_setup" &&
+      kind !== "session_conclusion" &&
+      kind !== "campaign_progression" &&
+      kind !== "lorebook_keeper") ||
     typeof title !== "string" ||
     typeof rawJson !== "string" ||
     typeof applyEndpoint !== "string"

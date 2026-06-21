@@ -56,6 +56,7 @@ import { useConnections } from "../../hooks/use-connections";
 import { useGenerate } from "../../hooks/use-generate";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { spriteKeys, type SpriteInfo } from "../../hooks/use-characters";
+import { lorebookKeys } from "../../hooks/use-lorebooks";
 import { api, getJsonRepairRequest, type JsonRepairRequest } from "../../lib/api-client";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { cn, type AvatarCrop, type LegacyAvatarCrop, type AvatarCropValue } from "../../lib/utils";
@@ -5027,6 +5028,10 @@ export function GameSurface({
       if (responseGameId) {
         queryClient.invalidateQueries({ queryKey: gameKeys.sessions(responseGameId) });
       }
+      if (typeof response.lorebookId === "string") {
+        queryClient.invalidateQueries({ queryKey: lorebookKeys.all });
+        queryClient.invalidateQueries({ queryKey: lorebookKeys.entries(response.lorebookId) });
+      }
 
       if (request.kind === "game_setup") {
         useGameModeStore.getState().setSetupActive(false);
@@ -7060,9 +7065,14 @@ export function GameSurface({
   const handleRegenerateSessionLorebook = useCallback(
     async (sessionNumber: number) => {
       if (!activeChatId) return;
-      await regenerateSessionLorebook.mutateAsync({ chatId: activeChatId, sessionNumber });
+      try {
+        await regenerateSessionLorebook.mutateAsync({ chatId: activeChatId, sessionNumber });
+      } catch (error) {
+        if (handleJsonRepairError(error)) return;
+        throw error;
+      }
     },
-    [activeChatId, regenerateSessionLorebook],
+    [activeChatId, handleJsonRepairError, regenerateSessionLorebook],
   );
 
   const handleUpdateCampaignProgression = useCallback(
