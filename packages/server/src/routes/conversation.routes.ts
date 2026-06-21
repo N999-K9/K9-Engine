@@ -34,6 +34,7 @@ import {
   clearGenerationInProgress,
   initializeActivityFromMessages,
 } from "../services/conversation/autonomous.service.js";
+import { getActiveTurnGame } from "../services/turn-games/turn-game-runner.service.js";
 import {
   getIntentHint,
   isIntentOnCooldown,
@@ -757,6 +758,13 @@ export async function conversationRoutes(app: FastifyInstance) {
     // Also skip autonomous check entirely if this chat IS an active scene
     if (meta.sceneStatus === "active") {
       return reply.send({ shouldTrigger: false, characterIds: [], reason: "scene_active", inactivityMs: 0 });
+    }
+
+    // Skip autonomous while a turn-game (UNO, etc.) is active. The game's bot turns
+    // already drive generation; an autonomous message here would seize the chat's
+    // single generation lock and 409 the next bot-turn request, stalling the game.
+    if (await getActiveTurnGame(app.db, chatId)) {
+      return reply.send({ shouldTrigger: false, characterIds: [], reason: "turn_game_active", inactivityMs: 0 });
     }
 
     const result = checkAutonomousMessaging(chatId, filteredSchedules, isGroup, {

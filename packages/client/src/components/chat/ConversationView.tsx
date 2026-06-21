@@ -16,6 +16,8 @@ import {
 import { Loader2, ChevronUp, Settings2, Image as ImageIcon, ArrowRightLeft } from "lucide-react";
 import { ConversationMessage } from "./ConversationMessage";
 import { ConversationInput } from "./ConversationInput";
+import { UnoBoard } from "./UnoBoard";
+import { UnoSetup } from "./UnoSetup";
 import { SceneBanner, EndSceneBar } from "./SceneBanner";
 import { ChatBranchSelector } from "./ChatBranchSelector";
 import { ActiveLorebookEntriesButton } from "./ActiveLorebookEntriesButton";
@@ -23,6 +25,7 @@ import { ChatToolbarButton, ChatToolbarMenu } from "./ChatToolbarControls";
 import { ConversationPresenceCard } from "./ConversationPresenceCard";
 import { TranscriptWindowControls } from "./TranscriptWindowControls";
 import { useChatStore } from "../../stores/chat.store";
+import { useUnoGameStore } from "../../stores/uno-game.store";
 import { useUIStore } from "../../stores/ui.store";
 import { playNotificationPing } from "../../lib/notification-sound";
 import { getTranscriptRenderWindow, TRANSCRIPT_RENDER_WINDOW_STEP } from "../../lib/transcript-render-window";
@@ -269,6 +272,9 @@ export function ConversationView({
 }: ConversationViewProps) {
   const streamingChatId = useChatStore((s) => s.streamingChatId);
   const isStreaming = useChatStore((s) => s.isStreaming) && streamingChatId === chatId;
+  const unoGameActive = useUnoGameStore((s) => s.current?.chatId === chatId && s.current?.status !== "finished");
+  const unoSetupOpen = useUnoGameStore((s) => s.setupChatId === chatId);
+  const closeUnoSetup = useUnoGameStore((s) => s.closeSetup);
   const isStreamCommitted = useChatStore((s) => s.committedStreamChatIds.has(chatId));
   const hasLiveStream = isStreaming && !isStreamCommitted;
   const streamBuffer = useChatStore((s) => s.streamBuffer);
@@ -1092,8 +1098,8 @@ export function ConversationView({
           </div>
         )}
 
-        {/* Scene banner — inline at bottom of messages (origin variant only) */}
-        {sceneInfo?.variant === "origin" && (
+        {/* Scene banner — inline at bottom of messages (origin variant only); hidden during a turn-game */}
+        {sceneInfo?.variant === "origin" && !unoGameActive && (
           <SceneBanner variant="origin" sceneChatId={sceneInfo.sceneChatId} sceneChatName={sceneInfo.sceneChatName} />
         )}
 
@@ -1122,6 +1128,14 @@ export function ConversationView({
           onAbandon={onAbandonScene}
         />
       )}
+
+      {/* ── Turn-game board (UNO, etc.) — self-hides when no game is active ── */}
+      <UnoBoard chatId={chatId} />
+      {/* Setup modal mounted once here (stable position) so it never double-renders.
+          Keyed by chatId so its internal selection/house-rule state resets on a
+          chat switch (matches ConversationInput below) — otherwise stale selected
+          ids would inflate botCount and could deal an empty botCharacterIds list. */}
+      <UnoSetup key={chatId} chatId={chatId} open={unoSetupOpen} onClose={closeUnoSetup} />
 
       {/* ── Input area ── */}
       <ConversationInput

@@ -4,6 +4,7 @@
 import { api } from "./api-client";
 import { useChatStore } from "../stores/chat.store";
 import { useUIStore } from "../stores/ui.store";
+import { useUnoGameStore } from "../stores/uno-game.store";
 import { toast } from "sonner";
 import {
   SUPPORTED_MACROS,
@@ -341,6 +342,19 @@ const COMMANDS: SlashCommand[] = [
       const detail = parsed.count > 1 ? ` [${rolls.join(", ")}]${modStr}` : modStr ? ` (${rolls[0]}${modStr})` : "";
       const text = `🎲 **${notation}** → **${sum}**${detail}`;
       ctx.createMessage({ role: "narrator", content: text });
+      return { handled: true };
+    },
+  },
+  {
+    name: "uno",
+    description: "Start a game of UNO with the characters in this chat",
+    usage: "/uno",
+    local: true,
+    async execute(_args, ctx) {
+      if (ctx.mode === "roleplay") {
+        return { handled: true, feedback: "UNO can only be played in conversation chats." };
+      }
+      useUnoGameStore.getState().openSetup(ctx.chatId);
       return { handled: true };
     },
   },
