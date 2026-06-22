@@ -695,6 +695,10 @@ export function SpotifyMiniPlayer({
   const startDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (!floating) return;
+      if (event.target instanceof Element && event.target.closest("button,a,input,textarea,select,[role='button']")) {
+        return;
+      }
+      event.preventDefault();
       dragRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -702,7 +706,11 @@ export function SpotifyMiniPlayer({
         originX: mobilePosition.x,
         originY: mobilePosition.y,
       };
-      event.currentTarget.setPointerCapture(event.pointerId);
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Some mobile browsers can deny capture if the pointer was already cancelled.
+      }
     },
     [floating, mobilePosition.x, mobilePosition.y],
   );
@@ -711,6 +719,7 @@ export function SpotifyMiniPlayer({
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const drag = dragRef.current;
       if (!drag || drag.pointerId !== event.pointerId) return;
+      event.preventDefault();
       const next = clampMobilePosition(
         drag.originX + event.clientX - drag.startX,
         drag.originY + event.clientY - drag.startY,
@@ -727,6 +736,13 @@ export function SpotifyMiniPlayer({
       if (!drag || drag.pointerId !== event.pointerId) return;
       const moved = Math.abs(event.clientX - drag.startX) + Math.abs(event.clientY - drag.startY);
       dragRef.current = null;
+      try {
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+      } catch {
+        // Ignore browsers that already released capture.
+      }
       if (moved < 6 && floating && collapsed) setCollapsed(false);
     },
     [collapsed, floating, setCollapsed],
@@ -1004,7 +1020,7 @@ export function SpotifyMiniPlayer({
   if (floating) {
     return (
       <div
-        className={cn("fixed z-[60]", mobile && "md:hidden")}
+        className={cn("fixed z-[60] touch-none select-none", mobile && "md:hidden")}
         style={mobileWidgetStyle}
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
