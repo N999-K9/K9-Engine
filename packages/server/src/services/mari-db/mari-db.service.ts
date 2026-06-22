@@ -720,15 +720,27 @@ function summarizeChatRow(row: Row): Row {
   };
 }
 
+function normalizeCharacterDataBase(base: Record<string, unknown>): Record<string, unknown> {
+  const source =
+    isRecord(base.data) && (typeof base.spec === "string" || typeof base.spec_version === "string")
+      ? (base.data as Record<string, unknown>)
+      : base;
+  const data = { ...source };
+  delete data.spec;
+  delete data.spec_version;
+  return data;
+}
+
 function buildMinimalCharacterData(
   name: string,
   base: Record<string, unknown>,
   flags: Map<string, string | boolean>,
 ): Record<string, unknown> {
-  const baseExtensions = isRecord(base.extensions) ? (base.extensions as Record<string, unknown>) : {};
+  const normalizedBase = normalizeCharacterDataBase(base);
+  const baseExtensions = isRecord(normalizedBase.extensions)
+    ? (normalizedBase.extensions as Record<string, unknown>)
+    : {};
   const data: Record<string, unknown> = {
-    spec: "chara_card_v2",
-    spec_version: "2.0",
     description: "",
     personality: "",
     scenario: "",
@@ -740,7 +752,7 @@ function buildMinimalCharacterData(
     post_history_instructions: "",
     system_prompt: "",
     tags: [],
-    ...base,
+    ...normalizedBase,
     name,
     extensions: { ...baseExtensions },
   };
@@ -1783,6 +1795,8 @@ export class MariDbService {
           throw new Error("Usage: mari lorebooks link-character <lorebook-id> --character <character-id> [--apply]");
         const lorebookExists = await this.getRawById(getMeta("lorebooks"), lorebookId);
         if (!lorebookExists) throw new Error(`Lorebook ${lorebookId} not found`);
+        const characterExists = await this.getRawById(getMeta("characters"), characterId);
+        if (!characterExists) throw new Error(`Character ${characterId} not found`);
         const timestamp = now();
         const linkRow: Row = { id: newId(), lorebookId, characterId, createdAt: timestamp };
         const request: ParsedMutationRequest = {
@@ -2760,9 +2774,9 @@ export class MariDbService {
       "Read:  list [--limit <n>] [--search <text>]",
       "Read:  get <id>",
       "Read:  search <query> [--limit <n>]",
-      "Write: create (--name <name> [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--backstory <text>] [--appearance <text>] [--comment <text>] | --json '<data_json>' | --json-file <path>) [--apply] [--reason <text>]",
+      "Write: create (--name <name> [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--comment <text>] | --json '<data_json>' | --json-file <path>) [--apply] [--reason <text>]",
       "       --backstory and --appearance write to data.extensions.backstory / data.extensions.appearance",
-      "Write: update <id> [--name <name>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--backstory <text>] [--appearance <text>] [--comment <text>] [--json '<data_json>'] [--apply] [--reason <text>]",
+      "Write: update <id> [--name <name>] [--description <text>] [--personality <text>] [--scenario <text>] [--first-mes <text>] [--creator-notes <text>] [--backstory <text>] [--appearance <text>] [--comment <text>] [--json '<data_json>' | --json-file <path>] [--apply] [--reason <text>]",
       "Write: delete <id> [--apply] [--reason <text>]",
       "Writes dry-run by default; --apply requests browser approval.",
     ].join("\n");
