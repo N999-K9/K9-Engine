@@ -66,6 +66,10 @@ interface SummaryPopoverProps {
   automaticSummaryEnabled?: boolean;
   activeAgentIds?: string[];
   summaryRunInterval?: number;
+  /** Per-chat persisted "Hide summarised messages" preference (metadata-backed). Undefined falls back to the legacy browser-local pref. */
+  hideSummarisedMessages?: boolean;
+  /** How many recent messages stay visible when summarised messages are auto-hidden (roleplay tail). Default 10. */
+  summaryTailMessages?: number;
   automaticSummariesAvailable?: boolean;
   totalMessageCount: number;
   summaryInjectionHint?: string | null;
@@ -256,6 +260,8 @@ export function SummaryPopover({
   automaticSummaryEnabled = false,
   activeAgentIds = [],
   summaryRunInterval,
+  hideSummarisedMessages,
+  summaryTailMessages,
   automaticSummariesAvailable = true,
   totalMessageCount,
   summaryInjectionHint = null,
@@ -296,6 +302,15 @@ export function SummaryPopover({
   const toggleSummaryEntry = useToggleSummaryEntry();
   const entryTextareaRef = useRef<HTMLTextAreaElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+
+  // "Hide summarised messages" is now a per-chat metadata setting so the server
+  // auto-summary can honor it. Fall back to the legacy browser-local pref when a
+  // chat has no persisted value yet (back-compat); nothing is written to
+  // metadata until the user toggles, so existing chats stay opt-out server-side.
+  const hideSummarisedResolved =
+    typeof hideSummarisedMessages === "boolean"
+      ? hideSummarisedMessages
+      : summaryPopoverSettings.hideSummarisedMessages;
 
   const persistSummaryContextSize = useCallback(
     (size: number) => {
@@ -498,7 +513,7 @@ export function SummaryPopover({
   const handleGenerate = useCallback(() => {
     if (!canGenerate) return;
     const maybeHideSummarisedMessages = (messageIds: string[] | undefined) => {
-      if (!summaryPopoverSettings.hideSummarisedMessages || !messageIds?.length) return;
+      if (!hideSummarisedResolved || !messageIds?.length) return;
       bulkSetMessagesHiddenFromAI.mutate({ chatId, messageIds, hidden: true });
     };
     if (sourceMode === "range") {
@@ -547,7 +562,7 @@ export function SummaryPopover({
     persistSummaryContextSize,
     sourceMode,
     activePromptTemplateId,
-    summaryPopoverSettings.hideSummarisedMessages,
+    hideSummarisedResolved,
   ]);
 
   const handleToggleExpanded = useCallback((entryId: string) => {
@@ -650,8 +665,21 @@ export function SummaryPopover({
         tone: "destructive",
       });
       if (!confirmed) return;
+      // Unhide the messages this entry covered, except any still referenced by
+      // another *enabled* entry (a disabled entry is not in the prompt, so its
+      // messages must become visible again). Prevents orphaned hidden messages.
+      const covered = entry.messageIds ?? [];
+      const stillCovered = new Set<string>();
+      for (const other of displayEntries) {
+        if (other.id === entry.id || !other.enabled) continue;
+        for (const id of other.messageIds ?? []) stillCovered.add(id);
+      }
+      const toUnhide = covered.filter((id) => !stillCovered.has(id));
       try {
         await deleteSummaryEntry.mutateAsync({ chatId, entryId: entry.id });
+        if (toUnhide.length > 0) {
+          bulkSetMessagesHiddenFromAI.mutate({ chatId, messageIds: toUnhide, hidden: false });
+        }
         if (editingEntryId === entry.id) handleCancelEditEntry();
         setExpandedEntryIds((current) => {
           const next = new Set(current);
@@ -662,7 +690,7 @@ export function SummaryPopover({
         toast.error("Could not delete summary entry.");
       }
     },
-    [chatId, deleteSummaryEntry, editingEntryId, handleCancelEditEntry],
+    [chatId, deleteSummaryEntry, bulkSetMessagesHiddenFromAI, displayEntries, editingEntryId, handleCancelEditEntry],
   );
 
   const persistPromptTemplates = useCallback(
@@ -861,9 +889,36 @@ export function SummaryPopover({
                 <p className="px-1 text-[0.6875rem] font-semibold text-[var(--popover-foreground)]">Display</p>
                 <SummarySettingsToggle
                   label="Hide summarised messages"
-                  checked={summaryPopoverSettings.hideSummarisedMessages}
-                  onChange={(checked) => setSummaryPopoverSettings({ hideSummarisedMessages: checked })}
+                  checked={hideSummarisedResolved}
+                  onChange={(checked) => {
+                    updateMeta.mutate({ id: chatId, hideSummarisedMessages: checked });
+                    setSummaryPopoverSettings({ hideSummarisedMessages: checked });
+                  }}
                 />
+                {hideSummarisedResolved && (
+                  <div className="space-y-1 px-1 pb-0.5">
+                    <label className="flex items-center justify-between gap-2 text-[0.6875rem] font-medium text-[var(--popover-foreground)]">
+                      <span>Recent message tail</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={50}
+                        step={1}
+                        value={summaryTailMessages ?? 10}
+                        onChange={(event) => {
+                          const raw = Number(event.target.value);
+                          const clamped = Number.isFinite(raw) ? Math.max(0, Math.min(50, Math.floor(raw))) : 10;
+                          updateMeta.mutate({ id: chatId, summaryTailMessages: clamped });
+                        }}
+                        className="w-16 rounded-md bg-[var(--secondary)] px-2 py-1 text-right text-xs outline-none ring-1 ring-transparent transition-shadow focus:ring-[var(--primary)]/40"
+                      />
+                    </label>
+                    <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                      Most recent messages kept word-for-word when auto-hiding summarised ones. Set to{" "}
+                      <span className="font-medium">0</span> to hide the whole batch.
+                    </p>
+                  </div>
+                )}
                 <SummarySettingsToggle
                   label="Collapse hidden messages"
                   checked={summaryPopoverSettings.collapseHiddenMessages}

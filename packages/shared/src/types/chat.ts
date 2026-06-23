@@ -190,6 +190,15 @@ export interface ChatMetadata {
   activeSummaryPromptTemplateId?: string | null;
   /** Optional text connection used for manual and automatic Roleplay chat summaries. Null uses the agent default. */
   summaryConnectionId?: string | null;
+  /**
+   * When true, the automatic roleplay/visual-novel rolling summary hides the
+   * messages it summarized (hiddenFromAI=true) except the most-recent
+   * `summaryTailMessages`, so the summary is a net token reduction. Opt-in:
+   * undefined/false never hides (back-compat for existing chats). Read by the
+   * SERVER auto-summary path; promoted from the browser-local ui.store
+   * `summaryPopoverSettings.hideSummarisedMessages` preference.
+   */
+  hideSummarisedMessages?: boolean;
   /** Custom tags for organisation */
   tags: string[];
   /** Whether agents are enabled for this chat */
@@ -468,9 +477,12 @@ export interface ChatMetadata {
    */
   dayRolloverHour?: number;
   /**
-   * How many of the most recent messages to keep verbatim in the prompt even
-   * after they've been summarized. Bridges the day boundary so characters can
-   * pick up the actual flow of recent conversation, not just the gist. 0 disables.
+   * How many of the most recent messages to keep verbatim even after they've
+   * been summarized. In conversation mode this bridges the day boundary so
+   * characters pick up the actual flow of recent conversation, not just the
+   * gist. In roleplay/visual-novel mode it is the protected tail for
+   * `hideSummarisedMessages`: the last N messages stay visible (never hidden)
+   * when the auto-summary hides the rest. 0 disables (hide the whole batch).
    * Valid range: 0-50. Default: 10.
    */
   summaryTailMessages?: number;

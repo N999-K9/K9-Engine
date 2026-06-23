@@ -202,6 +202,7 @@ import {
   buildLockedPersonaTrackerPatch,
   extractImageAttachmentDataUrls,
   appendNonLeadingSystemMessagesToLastUser,
+  computeSummaryHideIds,
   injectIntoOutputFormatOrLastUser,
   isManualTrackerCharacterId,
   isMessageHiddenFromAI,
@@ -216,6 +217,7 @@ import {
   prefixGroupIndividualHistorySpeakers,
   resolveActiveCharacterIds,
   resolveBaseUrl,
+  resolveRoleplaySummaryTail,
   resolveCharacterNameMap,
   resolvePromptCharacterIdsForTarget,
   resolveRegenerationGameStateFallbackMessageIds,
@@ -7376,10 +7378,32 @@ export async function generateRoutes(app: FastifyInstance) {
               });
             } else {
               const combined = typeof chatMeta.summary === "string" ? chatMeta.summary : newText;
+              // Opt-in token compression: hide the messages this summary covered
+              // (except the protected recent tail) so the summary is a net token
+              // reduction instead of an addition. Best-effort; never aborts the stream.
+              let hiddenMessageIds: string[] = [];
+              if (chatMeta.hideSummarisedMessages === true) {
+                // This branch only runs when a non-review entry was created, so the
+                // selected messages are exactly the ids the entry covers.
+                const entryMessageIds = selectedMessages.map((message: any) => message.id);
+                const toHide = computeSummaryHideIds({
+                  messages: freshMessages,
+                  entryMessageIds,
+                  tail: resolveRoleplaySummaryTail(chatMeta.summaryTailMessages),
+                });
+                if (toHide.length > 0) {
+                  try {
+                    await chats.bulkSetHiddenFromAI(input.chatId, toHide, true);
+                    hiddenMessageIds = toHide;
+                  } catch (err) {
+                    logger.error(err, "[chat-summary] Failed to auto-hide summarized roleplay messages");
+                  }
+                }
+              }
               reply.raw.write(
                 `data: ${JSON.stringify({
                   type: "chat_summary",
-                  data: { summary: combined, entry: createdEntry, entries: summaryEntries },
+                  data: { summary: combined, entry: createdEntry, entries: summaryEntries, hiddenMessageIds },
                 })}\n\n`,
               );
             }

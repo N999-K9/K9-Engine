@@ -61,10 +61,12 @@ import { DATA_DIR } from "../utils/data-dir.js";
 import { normalizeTimestampOverrides } from "../services/import/import-timestamps.js";
 import {
   appendNonLeadingSystemMessagesToLastUser,
+  computeSummaryHideIds,
   findTrackerContextInsertIndex,
   isManualTrackerCharacterId,
   parseExtra,
   resolveRoleplayChatSummary,
+  resolveRoleplaySummaryTail,
   isMessageHiddenFromAI,
   resolveBaseUrl,
   resolveActiveCharacterIds,
@@ -743,6 +745,25 @@ export async function chatsRoutes(app: FastifyInstance) {
         };
       });
       if (!updated) return reply.status(404).send({ error: "Chat not found" });
+      // Mirror the auto-summary token compression on the approval-gated path:
+      // once the user approves the entry, hide the messages it covered (except
+      // the protected recent tail) when the chat has opted in. Best-effort.
+      const committedMeta = parseExtra(updated.metadata) as Record<string, unknown>;
+      if (committedMeta.hideSummarisedMessages === true && messageIds.length > 0) {
+        try {
+          const allMessages = await storage.listMessages(req.params.id);
+          const toHide = computeSummaryHideIds({
+            messages: allMessages,
+            entryMessageIds: messageIds,
+            tail: resolveRoleplaySummaryTail(committedMeta.summaryTailMessages),
+          });
+          if (toHide.length > 0) {
+            await storage.bulkSetHiddenFromAI(req.params.id, toHide, true);
+          }
+        } catch (err) {
+          logger.error(err, "[chat-summary] Failed to auto-hide summarized messages on approval commit");
+        }
+      }
       return { ok: true, summary: combined, entry: createdEntry, entries: summaryEntries };
     }
 

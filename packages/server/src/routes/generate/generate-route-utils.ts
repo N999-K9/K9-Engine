@@ -471,6 +471,41 @@ export function isRoleplaySummaryMode(chatMode: string): boolean {
   return chatMode === "roleplay" || chatMode === "visual_novel";
 }
 
+/**
+ * Resolve the roleplay summary tail (how many recent messages stay visible when
+ * the auto-summary hides the rest) from the chat's `summaryTailMessages` value.
+ * Default 10 when unset/invalid; an explicit 0 means "hide the whole batch".
+ * Clamped to 0-50.
+ */
+export function resolveRoleplaySummaryTail(value: unknown): number {
+  if (value === undefined || value === null) return 10;
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n < 0) return 10;
+  return Math.min(50, n);
+}
+
+/**
+ * Compute which summarized message IDs the roleplay rolling summary should hide,
+ * protecting the most-recent `tail` *visible* messages so recent context stays
+ * in the prompt. Pure: `messages` must be chat-ordered (ascending). Returns the
+ * subset of `entryMessageIds` that is not in the protected tail.
+ */
+export function computeSummaryHideIds(args: {
+  messages: Array<{ id: string; extra?: unknown }>;
+  entryMessageIds: string[];
+  tail: number;
+}): string[] {
+  const { messages, entryMessageIds, tail } = args;
+  if (entryMessageIds.length === 0) return [];
+  const clampedTail = Number.isFinite(tail) ? Math.max(0, Math.min(50, Math.floor(tail))) : 0;
+  const visible = messages.filter((message) => !isMessageHiddenFromAI(message));
+  const tailIdSet = new Set(clampedTail > 0 ? visible.slice(-clampedTail).map((message) => message.id) : []);
+  const entryIdSet = new Set(entryMessageIds);
+  return messages
+    .filter((message) => entryIdSet.has(message.id) && !tailIdSet.has(message.id))
+    .map((message) => message.id);
+}
+
 export function resolveRoleplayChatSummary(chatMode: string, chatMetadata: Record<string, unknown>): string | null {
   if (!isRoleplaySummaryMode(chatMode)) return null;
   return ((chatMetadata.summary as string) ?? "").trim() || null;
