@@ -1,7 +1,7 @@
 // ──────────────────────────────────────────────
 // Storage: API Connections
 // ──────────────────────────────────────────────
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc, and, ne } from "drizzle-orm";
 import type { DB } from "../../db/connection.js";
 import { apiConnections } from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
@@ -153,6 +153,26 @@ export function createConnectionsStorage(db: DB) {
           }
         }
         updateFields.defaultForAgents = String(data.defaultForAgents);
+      } else if (data.provider !== undefined && existing.defaultForAgents === "true") {
+        if (effectiveProvider === "image_generation") {
+          await db
+            .update(apiConnections)
+            .set({ defaultForAgents: "false" })
+            .where(
+              and(
+                eq(apiConnections.defaultForAgents, "true"),
+                eq(apiConnections.provider, "image_generation"),
+                ne(apiConnections.id, id),
+              ),
+            );
+        } else {
+          const existingDefaults = await db.select().from(apiConnections).where(eq(apiConnections.defaultForAgents, "true"));
+          for (const row of existingDefaults) {
+            if (row.id !== id && row.provider !== "image_generation") {
+              await db.update(apiConnections).set({ defaultForAgents: "false" }).where(eq(apiConnections.id, row.id));
+            }
+          }
+        }
       }
       if (data.enableCaching !== undefined) {
         updateFields.enableCaching = String(data.enableCaching);

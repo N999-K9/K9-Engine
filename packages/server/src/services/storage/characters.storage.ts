@@ -86,6 +86,7 @@ function buildPersonaSnapshot(persona: PersonaRow): PersonaCardSnapshot {
     trackerCardColors: persona.trackerCardColors ?? '{"mode":"chat"}',
     personaStats: persona.personaStats ?? "",
     tags: persona.tags ?? "[]",
+    savedStatusOptions: persona.savedStatusOptions ?? "[]",
   };
 }
 
@@ -115,6 +116,7 @@ function normalizePersonaSnapshot(data: PersonaCardSnapshot): PersonaCardSnapsho
     trackerCardColors: data.trackerCardColors ?? '{"mode":"chat"}',
     personaStats: data.personaStats ?? "",
     tags: data.tags ?? "[]",
+    savedStatusOptions: data.savedStatusOptions ?? "[]",
   };
 }
 
@@ -290,6 +292,17 @@ export function createCharactersStorage(db: DB) {
 
     async remove(id: string) {
       await db.delete(characters).where(eq(characters.id, id));
+      const groups = await this.listGroups();
+      for (const group of groups) {
+        let memberIds: string[];
+        try {
+          memberIds = typeof group.characterIds === "string" ? (JSON.parse(group.characterIds) as string[]) : [];
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(memberIds) || !memberIds.includes(id)) continue;
+        await this.updateGroup(group.id, { characterIds: memberIds.filter((characterId) => characterId !== id) });
+      }
     },
 
     async duplicateCharacter(id: string) {
@@ -434,6 +447,17 @@ export function createCharactersStorage(db: DB) {
 
     async removePersona(id: string) {
       await db.delete(personas).where(eq(personas.id, id));
+      const groups = await this.listPersonaGroups();
+      for (const group of groups) {
+        let memberIds: string[];
+        try {
+          memberIds = JSON.parse(group.personaIds) as string[];
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(memberIds) || !memberIds.includes(id)) continue;
+        await this.updatePersonaGroup(group.id, { personaIds: memberIds.filter((personaId) => personaId !== id) });
+      }
     },
 
     async duplicatePersona(id: string) {
@@ -518,6 +542,7 @@ export function createCharactersStorage(db: DB) {
         ...(updates.trackerCardColors !== undefined && { trackerCardColors: updates.trackerCardColors }),
         ...(updates.personaStats !== undefined && { personaStats: updates.personaStats }),
         ...(updates.tags !== undefined && { tags: updates.tags }),
+        ...(updates.savedStatusOptions !== undefined && { savedStatusOptions: updates.savedStatusOptions }),
       });
       const nextComment = updates.comment !== undefined ? updates.comment : (existing.comment ?? "");
       const nextAvatarPath = updates.avatarPath !== undefined ? updates.avatarPath : existing.avatarPath;
@@ -583,6 +608,7 @@ export function createCharactersStorage(db: DB) {
           trackerCardColors: data.trackerCardColors,
           personaStats: data.personaStats,
           tags: data.tags,
+          savedStatusOptions: data.savedStatusOptions,
           updatedAt: now(),
         })
         .where(eq(personas.id, personaId));
@@ -625,7 +651,7 @@ export function createCharactersStorage(db: DB) {
 
     async updateGroup(
       id: string,
-      updates: { name?: string; description?: string; characterIds?: string[]; avatarPath?: string },
+      updates: { name?: string; description?: string; characterIds?: string[]; avatarPath?: string | null },
     ) {
       const existing = await this.getGroupById(id);
       if (!existing) return null;

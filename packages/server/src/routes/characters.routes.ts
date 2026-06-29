@@ -922,8 +922,14 @@ export async function charactersRoutes(app: FastifyInstance) {
     return storage.updatePersona(req.params.id, { avatarPath }, { versionReason: "Avatar update" });
   });
 
-  app.put<{ Params: { id: string } }>("/personas/:id/activate", async (req) => {
-    await storage.setActivePersona(req.params.id);
+  app.put<{ Params: { id: string } }>("/personas/:id/activate", async (req, reply) => {
+    const { id } = req.params;
+    if (isUnsafePathSegment(id)) {
+      return reply.status(400).send({ error: "Invalid persona id" });
+    }
+    const persona = await storage.getPersona(id);
+    if (!persona) return reply.status(404).send({ error: "Persona not found" });
+    await storage.setActivePersona(id);
     return { success: true };
   });
 

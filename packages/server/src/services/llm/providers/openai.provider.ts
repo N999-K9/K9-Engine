@@ -979,6 +979,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         "OpenAI chat() non-stream response",
       );
       const choices = OpenAIProvider.requireChatCompletionsChoices<{
+        finish_reason?: string | null;
         message: Record<string, unknown> & { content: string | unknown[] | null; refusal?: string };
       }>(json, "OpenAI chat() non-stream response");
       const msg = choices[0]?.message;
@@ -997,7 +998,9 @@ export class OpenAIProvider extends BaseLLMProvider {
       } else {
         yield (typeof msg?.content === "string" ? msg.content : "") || refusal;
       }
-      return OpenAIProvider.extractChatCompletionsUsage(json.usage as ChatCompletionsUsagePayload | undefined);
+      const usage = OpenAIProvider.extractChatCompletionsUsage(json.usage as ChatCompletionsUsagePayload | undefined);
+      const finishReason = choices[0]?.finish_reason;
+      return usage && finishReason ? { ...usage, finishReason } : usage;
     }
 
     // Stream SSE response
@@ -1018,6 +1021,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const decoder = new TextDecoder();
     let buffer = "";
     let streamUsage: LLMUsage | undefined;
+    let finishReason: string | undefined;
     const reasoningMetadata: Record<string, unknown> = {};
 
     try {
@@ -1034,7 +1038,7 @@ export class OpenAIProvider extends BaseLLMProvider {
           if (data == null) continue;
           if (data === "[DONE]") {
             this.emitChatCompletionsReasoning(options, reasoningMetadata);
-            if (streamUsage) return streamUsage;
+            if (streamUsage) return finishReason ? { ...streamUsage, finishReason } : streamUsage;
             return;
           }
 
@@ -1056,6 +1060,8 @@ export class OpenAIProvider extends BaseLLMProvider {
             }
             continue;
           }
+          const choice0 = parsed.choices[0] as { finish_reason?: string | null } | undefined;
+          if (choice0?.finish_reason) finishReason = choice0.finish_reason;
           const delta = (
             parsed.choices[0] as
               | { delta?: Record<string, unknown> & { content?: string | unknown[]; refusal?: string } }
@@ -1083,7 +1089,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       if (options.signal) options.signal.removeEventListener("abort", onAbort);
     }
     this.emitChatCompletionsReasoning(options, reasoningMetadata);
-    if (streamUsage) return streamUsage;
+    if (streamUsage) return finishReason ? { ...streamUsage, finishReason } : streamUsage;
   }
 
   /** Non-streaming completion with tool-call support */
@@ -1761,7 +1767,8 @@ export class OpenAIProvider extends BaseLLMProvider {
       this.emitEncryptedReasoning(json, options);
       const text = this.extractResponsesText(json);
       if (text) yield text;
-      return this.extractResponsesUsage(json);
+      const usage = this.extractResponsesUsage(json);
+      return usage && json.status === "incomplete" ? { ...usage, finishReason: "length" } : usage;
     }
 
     // Stream SSE
@@ -1847,6 +1854,7 @@ export class OpenAIProvider extends BaseLLMProvider {
               const resp = parsed.response as Record<string, unknown> | undefined;
               if (resp) {
                 streamUsage = this.extractResponsesUsage(resp);
+                if (resp.status === "incomplete" && streamUsage) streamUsage = { ...streamUsage, finishReason: "length" };
                 this.emitEncryptedReasoning(resp, options);
                 // If no text was streamed (e.g. refusal or content only in the
                 // completed payload), extract it as a last-resort fallback.
@@ -1871,6 +1879,18 @@ export class OpenAIProvider extends BaseLLMProvider {
               const resp = parsed.response as Record<string, unknown> | undefined;
               const reason = (resp?.incomplete_details as Record<string, unknown>)?.reason ?? "unknown";
               logger.warn("[OpenAI Responses] Stream ended with response.incomplete (reason=%s)", reason);
+              if (resp) {
+                streamUsage = this.extractResponsesUsage(resp);
+                this.emitEncryptedReasoning(resp, options);
+                if (!yieldedAny) {
+                  const fallback = this.extractResponsesText(resp);
+                  if (fallback) {
+                    yieldedAny = true;
+                    yield fallback;
+                  }
+                }
+              }
+              streamUsage = { ...(streamUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }), finishReason: "length" };
               break;
             }
             // Ignore other event types (response.created, response.in_progress, etc.)
